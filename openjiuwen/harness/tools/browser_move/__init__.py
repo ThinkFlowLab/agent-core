@@ -15,24 +15,16 @@ REPO_ROOT = _HERE.parents[4]
 __all__ = [
     "REPO_ROOT",
     "build_browser_runtime_mcp_config",
-    "register_browser_runtime_mcp_server",
     "reset_active_browser_runtimes",
     "reset_managed_browser_runtime",
-    "restart_local_browser_runtime_server",
-    "stop_local_browser_runtime_server",
 ]
 
 
 def __getattr__(name: str) -> Any:
     if name in {"reset_active_browser_runtimes", "reset_managed_browser_runtime"}:
-        module = import_module("openjiuwen.harness.tools.browser_move.playwright_runtime.runtime")
+        module = import_module("openjiuwen.harness.tools.browser_move.surfaces.browser.runner.facade")
         return getattr(module, name)
-    if name in {
-        "build_browser_runtime_mcp_config",
-        "register_browser_runtime_mcp_server",
-        "restart_local_browser_runtime_server",
-        "stop_local_browser_runtime_server",
-    }:
-        module = import_module("openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools")
+    if name == "build_browser_runtime_mcp_config":
+        module = import_module("openjiuwen.harness.tools.browser_move.surfaces.browser.runner.server_config")
         return getattr(module, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

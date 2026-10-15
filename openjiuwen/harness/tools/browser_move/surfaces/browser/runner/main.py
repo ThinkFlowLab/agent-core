@@ -1,0 +1,87 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+"""CLI entrypoint for the runtime demo."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+
+from openjiuwen.core.common.logging import logger
+from openjiuwen.harness.tools.browser_move.runtime.config import (
+    MISSING_API_KEY_MESSAGE,
+    CoreSettings,
+    load_repo_dotenv,
+    process_environ,
+)
+from openjiuwen.harness.tools.browser_move.runtime.topology import WORKER_LANGUAGE
+
+from .facade import BrowserAgentRuntime
+from .settings import browser_surface_settings, build_runtime_settings, read_demo_inputs
+
+
+async def main() -> None:
+    load_repo_dotenv()
+    environ = process_environ()
+    core_settings = CoreSettings.from_env(environ)
+    browser_settings = browser_surface_settings(environ)
+    settings = build_runtime_settings(core_settings=core_settings, browser_settings=browser_settings)
+    if not settings.api_key:
+        raise RuntimeError(MISSING_API_KEY_MESSAGE)
+
+    runtime = BrowserAgentRuntime(
+        provider=settings.provider,
+        api_key=settings.api_key,
+        api_base=settings.api_base,
+        model_name=settings.model_name,
+        mcp_cfg=settings.mcp_cfg,
+        guardrails=settings.guardrails,
+        core_settings=core_settings,
+        browser_settings=browser_settings,
+    )
+
+    initial_query, session_id = read_demo_inputs(environ)
+
+    try:
+        await runtime.ensure_started()
+        tools = runtime.agent_parts(image_support=False, language=WORKER_LANGUAGE).tools
+
+        logger.info("=" * 72)
+        logger.info("Playwright Runtime")
+        logger.info("=" * 72)
+        logger.info(f"Model provider: {settings.provider}")
+        logger.info(f"Model: {settings.model_name}")
+        logger.info(f"Server command: {settings.mcp_cfg.params.get('command')}")
+        logger.info(f"Server args: {settings.mcp_cfg.params.get('args')}")
+        logger.info(f"Tools: {len(tools)}")
+        for tool in tools:
+            logger.info(f"  - {tool.card.name}")
+        logger.info("=" * 72)
+        logger.info(f"Session: {session_id}")
+        logger.info("Continuous mode: enter a task and press Enter.")
+        logger.info("Type 'exit' or 'quit' to stop.")
+
+        query = initial_query
+        while True:
+            if not query:
+                query = input("query> ").strip()
+            if not query:
+                continue
+            if query.lower() in {"exit", "quit"}:
+                break
+
+            answer = await runtime.run_browser_task(task=query, session_id=session_id)
+            logger.info("Result:")
+            logger.info(json.dumps(answer, ensure_ascii=False, indent=2))
+            query = ""
+    except Exception as exc:
+        logger.error("Runtime error: %s", exc, exc_info=True)
+        raise
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user.")
+    finally:
+        await runtime.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

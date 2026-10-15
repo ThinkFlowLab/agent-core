@@ -15,6 +15,7 @@ from openjiuwen.core.foundation.llm.schema.config import ModelRequestConfig
 from openjiuwen.core.foundation.tool import McpServerConfig
 from openjiuwen.harness.rails.context_engineer import ContextProcessorRail
 from openjiuwen.harness.schema.config import SubAgentConfig
+from openjiuwen.harness.schema.decision_policy import DecisionPolicyModel
 from openjiuwen.harness.subagents.browser_agent import (
     BROWSER_AGENT_FACTORY_NAME,
     DEFAULT_BROWSER_AGENT_MAX_ITERATIONS,
@@ -23,19 +24,20 @@ from openjiuwen.harness.subagents.browser_agent import (
     build_browser_agent_config,
     create_browser_agent,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
-    BrowserRunGuardrails,
-    RuntimeSettings,
-)
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+from openjiuwen.harness.tools.browser_move.runtime.config import RunGuardrails
+from openjiuwen.harness.tools.browser_move.surfaces.browser.capabilities import (
     CORE_BROWSER_TOOL_NAMES,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
-    BrowserRuntimeRail,
-)
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_rail import (
+from openjiuwen.harness.tools.browser_move.surfaces.browser.profile import create_browser_surface
+from openjiuwen.harness.tools.browser_move.surfaces.browser.rails.runtime_rail import BrowserRuntimeRail
+from openjiuwen.harness.tools.browser_move.surfaces.browser.rails.working_context import (
     BrowserWorkingContextRail,
 )
+from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.agent import main_agent
+from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.facade import BrowserAgentRuntime
+from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.settings import RuntimeSettings
+
+_AGENT_MODULE = "openjiuwen.harness.tools.browser_move.surfaces.browser.runner.agent"
 
 
 def _fake_model() -> MagicMock:
@@ -56,15 +58,8 @@ def _fake_settings() -> RuntimeSettings:
         api_base="https://example.invalid/v1",
         model_name="test-model",
         mcp_cfg=mcp_cfg,
-        guardrails=BrowserRunGuardrails(max_steps=3, max_failures=1, timeout_s=30, retry_once=False),
+        guardrails=RunGuardrails(max_steps=3, max_failures=1, timeout_s=30, retry_once=False),
     )
-
-
-def _make_fake_tools():
-    tools = [MagicMock() for _ in range(3)]
-    for tool in tools:
-        tool.card = MagicMock()
-    return tools
 
 
 def _capture_create_deep_agent():
@@ -79,22 +74,18 @@ def _capture_create_deep_agent():
     return calls, fake
 
 
-def _patch_all(fake_create, *, runtime_mock=None, fake_tools=None):
+def _patch_all(fake_create, *, runtime_mock=None):
     stack = ExitStack()
     mock_runtime_cls = stack.enter_context(patch("openjiuwen.harness.subagents.browser_agent.BrowserAgentRuntime"))
     if runtime_mock is not None:
         mock_runtime_cls.return_value = runtime_mock
-    tools = fake_tools if fake_tools is not None else _make_fake_tools()
-    mock_build_tools = stack.enter_context(
-        patch("openjiuwen.harness.subagents.browser_agent.build_browser_runtime_tools", return_value=tools)
-    )
     stack.enter_context(
         patch(
-            "openjiuwen.harness.subagents.browser_agent.create_deep_agent",
+            "openjiuwen.harness.tools.browser_move.surfaces.browser.runner.agent.create_deep_agent",
             side_effect=fake_create,
         )
     )
-    return stack, mock_runtime_cls, mock_build_tools, tools
+    return stack, mock_runtime_cls
 
 
 def test_default_wiring_creates_one_agent() -> None:
@@ -107,7 +98,7 @@ def test_default_wiring_creates_one_agent() -> None:
 
 def test_browser_agent_registers_runtime_task_cleanup() -> None:
     calls, fake = _capture_create_deep_agent()
-    ctx, runtime_cls, _build_tools, _tools = _patch_all(fake)
+    ctx, runtime_cls = _patch_all(fake)
     with ctx:
         agent = create_browser_agent(_fake_model(), settings=_fake_settings())
 
@@ -193,7 +184,7 @@ def test_browser_agent_prompt_enforces_convergent_browser_strategy() -> None:
 def test_selected_capabilities_are_logged_and_forwarded_to_runtime(caplog) -> None:
     settings = _fake_settings()
     calls, fake = _capture_create_deep_agent()
-    ctx, mock_runtime_cls, _mock_build, _tools = _patch_all(fake)
+    ctx, mock_runtime_cls = _patch_all(fake)
     caplog.set_level("INFO")
 
     with ctx:
@@ -230,7 +221,7 @@ def test_unknown_capability_error_lists_rejected_and_available_names() -> None:
 
 def test_default_factory_always_forwards_core_allowlist() -> None:
     calls, fake = _capture_create_deep_agent()
-    ctx, mock_runtime_cls, _mock_build, _tools = _patch_all(fake)
+    ctx, mock_runtime_cls = _patch_all(fake)
 
     with ctx:
         create_browser_agent(_fake_model(), settings=_fake_settings())
@@ -252,7 +243,7 @@ def test_factory_exposes_only_selected_run_code_variant(
     excluded: str,
 ) -> None:
     calls, fake = _capture_create_deep_agent()
-    ctx, mock_runtime_cls, _mock_build, _tools = _patch_all(fake)
+    ctx, mock_runtime_cls = _patch_all(fake)
 
     with ctx:
         create_browser_agent(
@@ -292,15 +283,15 @@ def test_default_wiring_main_agent_has_no_subagents() -> None:
     assert calls[0].get("subagents", []) in (None, [])
 
 
-def test_default_wiring_main_agent_receives_browser_helper_tools() -> None:
+def test_default_wiring_main_agent_gets_its_browser_tools_at_the_first_invoke() -> None:
     calls, fake = _capture_create_deep_agent()
-    fake_tools = _make_fake_tools()
-    with _patch_all(fake, fake_tools=fake_tools)[0]:
+    ctx, mock_runtime_cls = _patch_all(fake)
+    with ctx:
         create_browser_agent(_fake_model(), settings=_fake_settings())
 
-    tool_cards = calls[0].get("tools", [])
-    for tool in fake_tools:
-        assert tool in tool_cards
+    assert calls[0].get("tools", []) == []
+    rail = next(rail for rail in calls[0]["rails"] if isinstance(rail, BrowserRuntimeRail))
+    assert rail._runtime is mock_runtime_cls.return_value
 
 
 def test_default_wiring_does_not_pre_register_playwright_mcp_on_subagent() -> None:
@@ -335,8 +326,6 @@ def test_default_wiring_adds_browser_state_and_windows_large_tool_results() -> N
     assert len(processors) == 3
     processor_map = dict(processors)
     config = processor_map["ToolResultWindowProcessor"]
-    # Pin the intended contract literally (not against the source constant) so a
-    # regression like the plain "browser_snapshot" name is actually caught.
     assert config.tool_names == [
         "browser_probe_interactives",
         "browser_probe_cards",
@@ -375,8 +364,6 @@ def test_caller_context_processor_rail_is_augmented_with_browser_state() -> None
 
     rails = calls[0].get("rails", [])
     context_rails = [rail for rail in rails if isinstance(rail, ContextProcessorRail)]
-    # Only the caller's rail is present, and it receives the required live state
-    # processor rather than competing with a second context rail.
     assert context_rails == [caller_rail]
     assert [key for key, _ in caller_rail._user_processors] == [
         "ToolResultWindowProcessor",
@@ -399,28 +386,16 @@ def test_default_wiring_does_not_add_sys_operation_rail() -> None:
 
 def test_default_wiring_adds_scoped_offload_recall_without_filesystem_tools() -> None:
     calls, fake = _capture_create_deep_agent()
-    with _patch_all(fake)[0]:
-        create_browser_agent(_fake_model(), settings=_fake_settings())
+    ctx, mock_runtime_cls = _patch_all(fake)
+    with ctx:
+        create_browser_agent(_fake_model(), settings=_fake_settings(), workspace="/tmp/ws", language="en")
 
-    tool_names = [
-        getattr(getattr(tool, "card", None), "name", None)
-        for tool in calls[0].get("tools", [])
-    ]
-    assert "browser_recall_offload" in tool_names
+    tool_names = [getattr(getattr(tool, "card", None), "name", None) for tool in calls[0].get("tools", [])]
     assert "read_file" not in tool_names
     assert "bash" not in tool_names
     assert "powershell" not in tool_names
-
-
-def test_default_wiring_build_tools_called_with_runtime_instance() -> None:
-    calls, fake = _capture_create_deep_agent()
-    ctx, mock_runtime_cls, mock_build_tools, _tools = _patch_all(fake)
-    with ctx:
-        create_browser_agent(_fake_model(), settings=_fake_settings())
-
-    del calls
-    mock_build_tools.assert_called_once()
-    assert mock_build_tools.call_args.args[0] is mock_runtime_cls.return_value
+    assert mock_runtime_cls.call_args.kwargs["workspace"] == "/tmp/ws"
+    assert mock_runtime_cls.call_args.kwargs["language"] == "en"
 
 
 def test_custom_subagents_are_forwarded() -> None:
@@ -435,7 +410,7 @@ def test_custom_subagents_are_forwarded() -> None:
 def test_settings_forwarded_to_runtime_constructor() -> None:
     settings = _fake_settings()
     calls, fake = _capture_create_deep_agent()
-    ctx, mock_runtime_cls, _mock_build, _tools = _patch_all(fake)
+    ctx, mock_runtime_cls = _patch_all(fake)
     with ctx:
         create_browser_agent(_fake_model(), settings=settings)
 
@@ -449,19 +424,19 @@ def test_settings_forwarded_to_runtime_constructor() -> None:
         guardrails=settings.guardrails,
         instance=settings.instance,
         allowed_tool_names=CORE_BROWSER_TOOL_NAMES,
+        workspace=None,
+        language="cn",
     )
 
 
 def _model_without_client_config() -> SimpleNamespace:
-    # model_client_config=None routes _resolve_runtime_settings through
-    # build_runtime_settings(instance), exercising the keyed-instance path.
     return SimpleNamespace(model_client_config=None, model_config=None)
 
 
 def test_browser_key_threads_keyed_instance_to_runtime() -> None:
     """A bare browser_key becomes a keyed BrowserInstanceConfig on the runtime."""
     calls, fake = _capture_create_deep_agent()
-    ctx, mock_runtime_cls, _mock_build, _tools = _patch_all(fake)
+    ctx, mock_runtime_cls = _patch_all(fake)
     with ctx:
         create_browser_agent(_model_without_client_config(), browser_key="teammate-A")
 
@@ -469,14 +444,13 @@ def test_browser_key_threads_keyed_instance_to_runtime() -> None:
     instance = mock_runtime_cls.call_args.kwargs["instance"]
     assert instance is not None
     assert instance.key == "teammate-A"
-    # The MCP server_id carried into the runtime must be isolated by the key.
     assert mock_runtime_cls.call_args.kwargs["mcp_cfg"].server_id.endswith("__teammate-A")
 
 
 def test_browser_instance_dict_threads_port_to_runtime() -> None:
     """A serializable instance dict (teams-wire form) rebuilds into the runtime."""
     calls, fake = _capture_create_deep_agent()
-    ctx, mock_runtime_cls, _mock_build, _tools = _patch_all(fake)
+    ctx, mock_runtime_cls = _patch_all(fake)
     with ctx:
         create_browser_agent(
             _model_without_client_config(),
@@ -514,7 +488,7 @@ def test_user_tools_are_merged_with_browser_tools() -> None:
 
     tool_cards = calls[0].get("tools", [])
     assert user_tool in tool_cards
-    assert len(tool_cards) == 5
+    assert len(tool_cards) == 1
 
 
 def test_build_browser_agent_config_uses_browser_factory() -> None:
@@ -542,3 +516,83 @@ def test_build_browser_agent_config_fallback_uses_model_name_field() -> None:
     spec = build_browser_agent_config(model, language="en")
 
     assert spec.factory_kwargs["settings"].model_name == "test-model-name"
+
+
+class _PolicyModel:
+    """Structural DecisionPolicyModel: bind_runtime is the only required method."""
+
+    def __init__(self) -> None:
+        self.bound = None
+
+    def bind_runtime(self, runtime) -> None:
+        self.bound = runtime
+
+
+def test_decision_policy_model_is_recognised_by_structure() -> None:
+    assert isinstance(_PolicyModel(), DecisionPolicyModel)
+    assert not isinstance(_fake_model(), DecisionPolicyModel)
+
+
+def test_decision_policy_model_is_used_as_is_and_bound_to_the_runtime() -> None:
+    calls, fake = _capture_create_deep_agent()
+    policy = _PolicyModel()
+    ctx, runtime_cls = _patch_all(fake)
+    with ctx:
+        create_browser_agent(policy, settings=_fake_settings())
+
+    assert calls[0]["model"] is policy
+    assert policy.bound is runtime_cls.return_value
+    assert calls[0]["enable_model_anomaly_detection_rail"] is False
+    assert not any(isinstance(rail, ContextProcessorRail) for rail in calls[0]["rails"])
+
+
+def test_the_core_rails_come_from_the_runtime_at_construction() -> None:
+    calls, fake = _capture_create_deep_agent()
+    runtime = MagicMock(spec=BrowserAgentRuntime)
+    core = (object(), object(), object())
+    runtime.core_rails.return_value = core
+    ctx, _ = _patch_all(fake, runtime_mock=runtime)
+    with ctx:
+        create_browser_agent(_fake_model(), settings=_fake_settings())
+
+    rails = calls[0]["rails"]
+    assert [rail for rail in rails if rail in core] == list(core)
+    assert rails.index(core[0]) > rails.index(next(r for r in rails if isinstance(r, BrowserRuntimeRail)))
+    runtime.core_rails.assert_called_once_with()
+
+
+def test_a_given_runtime_is_used_instead_of_a_new_facade() -> None:
+    calls, fake_create = _capture_create_deep_agent()
+    given = MagicMock(spec=BrowserAgentRuntime)
+    with (
+        patch("openjiuwen.harness.subagents.browser_agent.BrowserAgentRuntime") as runtime_cls,
+        patch(
+            "openjiuwen.harness.tools.browser_move.surfaces.browser.runner.agent.create_deep_agent",
+            side_effect=fake_create,
+        ),
+    ):
+        create_browser_agent(_fake_model(), runtime=given)
+
+    runtime_cls.assert_not_called()
+    rails = [rail for rail in calls[0]["rails"] if isinstance(rail, BrowserRuntimeRail)]
+    assert len(rails) == 1 and rails[0]._runtime is given
+
+
+def test_the_browser_profile_builds_its_main_agent_through_the_hook() -> None:
+    calls, fake_create = _capture_create_deep_agent()
+    runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime.core_rails.return_value = ()
+    runtime.core.worker_temperature = 0.3
+
+    assert create_browser_surface({}).profile.main_agent is main_agent
+    with patch(f"{_AGENT_MODULE}.create_deep_agent", side_effect=fake_create):
+        agent = main_agent(
+            runtime, _fake_model(), language="en", max_iterations=7, workspace=None, capabilities=("core",)
+        )
+
+    assert calls[0]["max_iterations"] == 7 and calls[0]["language"] == "en"
+    assert calls[0]["model"].model_config.temperature == 0.3
+    assert any(isinstance(rail, BrowserRuntimeRail) and rail._runtime is runtime for rail in calls[0]["rails"])
+    agent.register_task_resource_cleanup.assert_called_once_with(
+        runtime.release_task_resources, prepare=runtime.acquire_task_resources
+    )

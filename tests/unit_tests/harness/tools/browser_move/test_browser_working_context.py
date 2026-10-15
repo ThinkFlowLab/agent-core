@@ -16,28 +16,28 @@ from openjiuwen.core.foundation.llm import AssistantMessage, ToolMessage, UserMe
 from openjiuwen.core.foundation.llm.schema.tool_call import ToolCall
 from openjiuwen.core.session.agent import create_agent_session
 from openjiuwen.core.single_agent.rail.base import (
-    AgentCallbackEvent,
     AgentCallbackContext,
+    AgentCallbackEvent,
     InvokeInputs,
     ModelCallInputs,
     ToolCallInputs,
 )
 from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 from openjiuwen.harness.tools.base_tool import ToolOutput
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context import (
+from openjiuwen.harness.tools.browser_move.surfaces.browser.rails.working_context import (
+    BrowserWorkingContextRail,
+)
+from openjiuwen.harness.tools.browser_move.surfaces.browser.working_context.processor import (
+    BrowserWorkingContextProcessor,
+    BrowserWorkingContextProcessorConfig,
+)
+from openjiuwen.harness.tools.browser_move.surfaces.browser.working_context.store import (
     BROWSER_TASK_STATE_KEY,
     BROWSER_TOOL_MEMORY_METADATA_KEY,
     BROWSER_WORKING_CONTEXT_STATE_KEY,
     BROWSER_WORKING_MEMORY_RECORD_BEGIN,
     BROWSER_WORKING_MEMORY_RECORD_END,
     BrowserWorkingContextStore,
-)
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_processor import (
-    BrowserWorkingContextProcessor,
-    BrowserWorkingContextProcessorConfig,
-)
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context_rail import (
-    BrowserWorkingContextRail,
 )
 
 
@@ -200,9 +200,7 @@ def test_missing_model_update_does_not_erase_last_valid_state() -> None:
     rail = BrowserWorkingContextRail(config)
     session = _FakeSession()
     context = _FakeContext(session)
-    valid_response = _response(
-        _memory("Keep this confirmed task", status="completed", key_facts=["Confirmed fact"])
-    )
+    valid_response = _response(_memory("Keep this confirmed task", status="completed", key_facts=["Confirmed fact"]))
     _run(rail.after_model_call(_model_ctx(rail, session, context, valid_response)))
 
     missing_update = AssistantMessage(content="Visible answer without internal state")
@@ -441,6 +439,29 @@ def test_one_step_content_is_injected_exactly_once() -> None:
     assert raw_message.metadata[BROWSER_TOOL_MEMORY_METADATA_KEY]
 
 
+def test_tool_errors_are_retained_from_the_message_metadata() -> None:
+    config = BrowserWorkingContextProcessorConfig()
+    rail = BrowserWorkingContextRail(config)
+    session = _FakeSession()
+    context = _FakeContext(session)
+    tool_call = _tool_call("call-failed", "browser_probe_cards")
+    response = _response(_memory("Read the cards"), tool_calls=[tool_call])
+    model_ctx = _model_ctx(rail, session, context, response)
+    _run(rail.after_model_call(model_ctx))
+    context.messages.append(
+        ToolMessage(
+            content='{"ok": false, "error": "no cards on this page", "cards": []}',
+            tool_call_id="call-failed",
+            metadata={"success": False, "effect": "read"},
+        )
+    )
+
+    _run(rail.after_react_iteration(model_ctx))
+
+    state = BrowserWorkingContextStore(config).load(session)
+    assert state.recent_steps[0].tool_memories[0].error == "no cards on this page"
+
+
 def test_tool_errors_are_retained_without_explicit_tool_metadata() -> None:
     config = BrowserWorkingContextProcessorConfig()
     rail = BrowserWorkingContextRail(config)
@@ -530,12 +551,8 @@ def test_context_engine_injection_does_not_persist_as_execution_history() -> Non
     assert len(second_window.context_messages) == 2
     assert first_window.context_messages[-1].metadata["browser_working_context"] is True
     assert second_window.context_messages[-1].metadata["browser_working_context"] is True
-    assert first_window.context_messages[-1].metadata["context_message_id"] == (
-        "openjiuwen:browser-working-context"
-    )
-    assert second_window.context_messages[-1].metadata["context_message_id"] == (
-        "openjiuwen:browser-working-context"
-    )
+    assert first_window.context_messages[-1].metadata["context_message_id"] == ("openjiuwen:browser-working-context")
+    assert second_window.context_messages[-1].metadata["context_message_id"] == ("openjiuwen:browser-working-context")
 
 
 def test_processor_guidance_defines_each_working_memory_field() -> None:
@@ -932,9 +949,7 @@ def test_processor_replaces_only_its_own_ephemeral_message() -> None:
 
 
 def test_processor_runtime_projection_ignores_legacy_model_memory() -> None:
-    processor = BrowserWorkingContextProcessor(
-        BrowserWorkingContextProcessorConfig(runtime_projection_only=True)
-    )
+    processor = BrowserWorkingContextProcessor(BrowserWorkingContextProcessorConfig(runtime_projection_only=True))
     session = _FakeSession()
     session.update_state(
         {
@@ -1055,9 +1070,7 @@ def test_semantic_observation_closes_sort_evidence_before_replan_gate() -> None:
                     "extraction": {"status": "pending", "attempts": 0, "budget": 20},
                 },
                 "required_fields": ["sort_state", "title"],
-                "required_evidence_slots": [
-                    {"entity": "product", "variant": "default", "field": "sort_state"}
-                ],
+                "required_evidence_slots": [{"entity": "product", "variant": "default", "field": "sort_state"}],
                 "field_coverage": [],
                 "structured_evidence": [],
                 "evidence_slots": [],

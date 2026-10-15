@@ -9,11 +9,26 @@ from unittest.mock import MagicMock
 import pytest
 
 from openjiuwen.core.foundation.llm import ToolCall
-from openjiuwen.core.foundation.llm.schema.message import ToolMessage
 from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, ModelCallInputs, ToolCallInputs
 from openjiuwen.harness.deep_agent import DeepAgent
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime, BrowserRuntimeRail
-from tests.unit_tests.harness.tools.browser_move.test_browser_runtime_rail import _FakeSession, _run
+from openjiuwen.harness.tools.browser_move.contract import ActionTimeout, RunScript
+from openjiuwen.harness.tools.browser_move.surfaces.browser.rails.runtime_rail import BrowserRuntimeRail
+from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.facade import BrowserAgentRuntime
+from tests.unit_tests.harness.tools.browser_move.runtime_fixtures import (
+    BATCH,
+    MCP_PREFIX,
+    PROBE,
+    UNKNOWN,
+    command_kind,
+    make_runtime,
+    mcp_fake_driver,
+    observation,
+)
+from tests.unit_tests.harness.tools.browser_move.test_browser_runtime_rail import _FakeSession, _run, _tool_ctx
+
+SNAPSHOT = MCP_PREFIX + "browser_snapshot"
+EVALUATE = MCP_PREFIX + "browser_evaluate"
+SCRIPT = command_kind(RunScript("() => document.querySelector('#weather').textContent"))
 
 
 STATE_KEY = "__browser_phase_budget_state__"
@@ -27,21 +42,11 @@ def _observed_state(task="Report Singapore's high_temperature and low_temperatur
     BrowserRuntimeRail._record_tool_evidence(
         state,
         {"result": {"sel": "#weather", "text": WEATHER_TEXT}, "generation_id": "g3"},
-        tool_name="mcp_playwright-official_browser_evaluate",
+        kind=SCRIPT,
+        tool_name=EVALUATE,
         tool_args={"function": "() => document.querySelector('#weather').textContent"},
     )
     return state
-
-
-def test_ax_links_are_not_current_page_metadata():
-    ax = '- link "weather" [ref=e1]:\n  - /url: https://weather.example/detail\n'
-    assert BrowserAgentRuntime.extract_result_url(ax) == ""
-    assert BrowserAgentRuntime.extract_result_url({"cards": [{"url": "https://weather.example/detail"}]}) == ""
-    assert BrowserAgentRuntime.extract_result_url(f"### Page\n- Page URL: {WEATHER_URL}\n{ax}") == WEATHER_URL
-    assert BrowserAgentRuntime.extract_result_url({"page_state": {"url": WEATHER_URL}}) == WEATHER_URL
-    assert BrowserAgentRuntime.extract_result_url({"content": [
-        {"type": "text", "text": f"### Page\n- Page URL: {WEATHER_URL}\n{ax}"}
-    ]}) == WEATHER_URL
 
 
 def test_search_results_word_does_not_invent_title_requirement():
@@ -49,13 +54,14 @@ def test_search_results_word_does_not_invent_title_requirement():
         "low_temperature"
     ]
     assert BrowserRuntimeRail._infer_required_fields("Report high_temperature and low_temperature") == [
-        "high_temperature", "low_temperature"
+        "high_temperature",
+        "low_temperature",
     ]
 
 
 def test_sourced_weather_answer_does_not_require_another_field_mapping_lookup():
     state = _observed_state()
-    assert not state["field_coverage"]  # Do not invent typed temperature evidence from arbitrary text.
+    assert not state["field_coverage"]
     session = _FakeSession()
     session.update_state({STATE_KEY: state})
     BrowserRuntimeRail._apply_worker_progress_to_task_state(session, {"status": "completed"}, WEATHER_TEXT)
@@ -106,14 +112,22 @@ def test_raw_observations_do_not_override_hard_requirements(case):
 
 def test_progress_alias_with_complete_typed_evidence_remains_completed():
     state = BrowserRuntimeRail._build_phase_state("Return title")
-    BrowserRuntimeRail._record_tool_evidence(state, {"extracted": {"title": "Weather"}},
-                                            tool_name="browser_batch_interact", tool_args={})
+    BrowserRuntimeRail._record_tool_evidence(
+        state, {"extracted": {"title": "Weather"}}, kind=BATCH, tool_name="browser_batch_interact", tool_args={}
+    )
     session = _FakeSession()
     session.update_state({STATE_KEY: state})
-    ctx = AgentCallbackContext(agent=MagicMock(), session=session, inputs=ToolCallInputs(
-        tool_name="browser_progress", tool_args={"status": "completed"},
-    ))
-    _run(BrowserRuntimeRail(MagicMock(spec=BrowserAgentRuntime)).before_tool_call(ctx))
+    ctx = AgentCallbackContext(
+        agent=MagicMock(),
+        session=session,
+        inputs=ToolCallInputs(
+            tool_name="browser_progress",
+            tool_args={"status": "completed"},
+        ),
+    )
+    runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime.tool_kind.return_value = UNKNOWN
+    _run(BrowserRuntimeRail(runtime).before_tool_call(ctx))
     result = ctx.consume_force_finish().result["authoritative_browser_result"]
     assert result["status"] == "completed"
     assert result["evidence"][0]["value"] == "Weather"
@@ -124,7 +138,8 @@ def test_generation_or_selector_change_does_not_turn_same_observation_into_progr
     delta = BrowserRuntimeRail._record_tool_evidence(
         state,
         {"result": {"sel": ".weather", "text": WEATHER_TEXT}, "generation_id": "g9"},
-        tool_name="mcp_playwright-official_browser_evaluate",
+        kind=SCRIPT,
+        tool_name=EVALUATE,
         tool_args={"function": "() => document.querySelector('.weather').textContent"},
     )
     assert not delta["evidence_added"]
@@ -132,51 +147,63 @@ def test_generation_or_selector_change_does_not_turn_same_observation_into_progr
     assert len(BrowserRuntimeRail._task_observations(state)) == 1
 
 
-def test_raw_snapshot_evidence_uses_live_page_generation():
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    runtime.export_page_state.return_value = {"url": WEATHER_URL, "generation_id": "g3"}
+def _snapshot_runtime(driver) -> tuple[BrowserAgentRuntime, dict, _FakeSession]:
+    runtime = make_runtime(driver)
     state = BrowserRuntimeRail._build_phase_state("Report low_temperature")
     session = _FakeSession()
     session.update_state({STATE_KEY: state})
-    ctx = AgentCallbackContext(agent=MagicMock(), session=session, inputs=ToolCallInputs(
-        tool_name="mcp_playwright-official_browser_snapshot", tool_args={}, tool_result=WEATHER_TEXT,
-        tool_msg=ToolMessage(content=WEATHER_TEXT, tool_call_id="snapshot"),
-    ))
+    return runtime, state, session
+
+
+def test_raw_snapshot_evidence_uses_live_page_generation():
+    driver = mcp_fake_driver(observations=[observation(text=WEATHER_TEXT, url=WEATHER_URL)])
+    runtime, state, session = _snapshot_runtime(driver)
+    tool = next(t for t in runtime.agent_parts(image_support=False, language="en").tools if t.card.name == SNAPSHOT)
+    output = _run(tool.invoke({}))
+    ctx = _tool_ctx(runtime, SNAPSHOT, {}, output, session=session)
     _run(BrowserRuntimeRail(runtime).after_tool_call(ctx))
-    observation = BrowserRuntimeRail._task_observations(state)[0]
-    assert observation["source"] == WEATHER_URL
-    assert observation["generation_id"] == "g3"
-    assert "low 26 C" in observation["raw_text"]
+    observed = BrowserRuntimeRail._task_observations(state)[0]
+    assert observed["source"] == WEATHER_URL
+    assert observed["generation_id"] == runtime.generation_id
+    assert "low 26 C" in observed["raw_text"]
 
 
 def test_string_error_is_not_promoted_to_page_evidence_when_wrapped():
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    runtime.export_page_state.return_value = {"url": WEATHER_URL, "generation_id": "g3"}
-    state = BrowserRuntimeRail._build_phase_state("Report low_temperature")
-    session = _FakeSession()
-    session.update_state({STATE_KEY: state})
-    error = "### Error\nTimeoutError: waiting for weather panel"
-    ctx = AgentCallbackContext(agent=MagicMock(), session=session, inputs=ToolCallInputs(
-        tool_name="mcp_playwright-official_browser_snapshot", tool_args={}, tool_result=error,
-        tool_msg=ToolMessage(content=error, tool_call_id="snapshot-error"),
-    ))
+    driver = mcp_fake_driver()
+    driver.fail_next(ActionTimeout("TimeoutError: waiting for weather panel", dispatched=True))
+    runtime, state, session = _snapshot_runtime(driver)
+    tool = next(t for t in runtime.agent_parts(image_support=False, language="en").tools if t.card.name == SNAPSHOT)
+    output = _run(tool.invoke({}))
+    assert output.error.startswith("### Error")
+    ctx = _tool_ctx(runtime, SNAPSHOT, {}, output, session=session)
     _run(BrowserRuntimeRail(runtime).after_tool_call(ctx))
     assert BrowserRuntimeRail._task_observations(state) == []
     assert state["recent_actions"][-1]["outcome_status"] == "failed"
-    runtime.record_tool_reference_state.assert_not_called()
+
+
+def test_card_probe_completes_extraction_for_a_requested_count_but_not_for_one_item():
+    cards_result = {"cards": [{"title": "Item 1", "result_index": 1}]}
+
+    one_item_state = BrowserRuntimeRail._build_phase_state("Find a vegetarian lasagna rated 4.5 or higher")
+    assert one_item_state["requested_result_count"] == 0
+    assert BrowserRuntimeRail._phase_completion_evidence("extraction", PROBE, cards_result, one_item_state) == ""
+
+    list_state = BrowserRuntimeRail._build_phase_state("Find the top 3 vegetarian lasagna recipes")
+    assert list_state["requested_result_count"] == 3
+    assert BrowserRuntimeRail._phase_completion_evidence("extraction", PROBE, cards_result, list_state) != ""
 
 
 def _admission_context(calls):
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    runtime.semantic_progress = {}
-    runtime.export_page_state.return_value = {"url": WEATHER_URL, "generation_id": "g3"}
+    runtime = make_runtime()
+    runtime.page_state.observe(url=WEATHER_URL)
     rail = BrowserRuntimeRail(runtime)
     state = BrowserRuntimeRail._build_phase_state("Read weather details")
     state.update(status="replan_required", replan_required=True, replan_count=0)
     session = _FakeSession()
     session.update_state({STATE_KEY: state})
     ctx = AgentCallbackContext(
-        agent=MagicMock(), session=session,
+        agent=MagicMock(),
+        session=session,
         inputs=ModelCallInputs(response=SimpleNamespace(content="", tool_calls=calls)),
     )
     _run(rail.after_model_call(ctx))
@@ -190,8 +217,15 @@ def _admit(rail, ctx, call):
 
 
 def test_same_group_parallel_reads_use_one_replan_trial():
-    calls = [ToolCall(id=str(index), type="function", name="mcp_playwright-official_browser_find",
-                      arguments=json.dumps({"query": query})) for index, query in enumerate(("humidity", "wind"))]
+    calls = [
+        ToolCall(
+            id=str(index),
+            type="function",
+            name="mcp_playwright-official_browser_find",
+            arguments=json.dumps({"query": query}),
+        )
+        for index, query in enumerate(("humidity", "wind"))
+    ]
     rail, ctx, state = _admission_context(calls)
     assert _admit(rail, ctx, calls[0]) is None
     assert _admit(rail, ctx, calls[1]) is None
@@ -202,8 +236,9 @@ def test_same_group_parallel_reads_use_one_replan_trial():
 def test_read_trial_does_not_admit_a_mutating_action_in_same_group():
     calls = [
         ToolCall(id="find", type="function", name="mcp_playwright-official_browser_find", arguments='{"query":"wind"}'),
-        ToolCall(id="key", type="function", name="mcp_playwright-official_browser_press_key",
-                 arguments='{"key":"End"}'),
+        ToolCall(
+            id="key", type="function", name="mcp_playwright-official_browser_press_key", arguments='{"key":"End"}'
+        ),
     ]
     rail, ctx, _ = _admission_context(calls)
     assert _admit(rail, ctx, calls[0]) is None
@@ -227,12 +262,6 @@ def test_schema_error_does_not_reserve_or_consume_replan_trial():
     assert state["replan_count"] == 1
 
 
-def test_server_prefixed_local_batch_is_canonicalized_to_registered_runtime_tool():
-    rail = BrowserRuntimeRail(MagicMock(spec=BrowserAgentRuntime))
-    assert rail._canonicalize_tool_name("mcp_playwright-official_browser_batch_interact") == "browser_batch_interact"
-    assert rail._canonicalize_tool_name("playwright-official-browser_batch_interact") == "browser_batch_interact"
-
-
 def test_unknown_tool_does_not_consume_semantic_budget():
     call = ToolCall(id="typo", type="function", name="browser_unknown_tool", arguments="{}")
     rail, ctx, state = _admission_context([call])
@@ -244,9 +273,20 @@ def test_unknown_tool_does_not_consume_semantic_budget():
 
 def test_typed_run_context_reaches_runtime_deadline_and_resume_contract():
     normalizer = DeepAgent.__new__(DeepAgent)
-    inputs = normalizer._normalize_inputs({"query": "only missing fields", "run": {"context": {"extra": {
-        "browser_resume": True, "browser_query_id": "q-1", "browser_query_budget_s": 600,
-    }}}})
+    inputs = normalizer._normalize_inputs(
+        {
+            "query": "only missing fields",
+            "run": {
+                "context": {
+                    "extra": {
+                        "browser_resume": True,
+                        "browser_query_id": "q-1",
+                        "browser_query_budget_s": 600,
+                    }
+                }
+            },
+        }
+    )
     ctx = AgentCallbackContext(agent=MagicMock(), inputs=inputs)
     assert BrowserRuntimeRail._browser_run_context(ctx)["browser_resume"] is True
     ctx.extra["run_context"] = inputs.run_context

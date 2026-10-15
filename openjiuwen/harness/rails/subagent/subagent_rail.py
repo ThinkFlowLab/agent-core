@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Callable, Collection, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, Collection, List, Optional
 
 from openjiuwen.core.common.logging import logger
 from openjiuwen.core.foundation.tool import ToolCard
@@ -15,9 +15,6 @@ from openjiuwen.harness.prompts.tools import get_tool_description
 from openjiuwen.harness.rails.base import DeepAgentRail
 from openjiuwen.harness.schema.config import SubAgentConfig
 from openjiuwen.harness.tools import SessionToolkit, build_session_tools, create_task_tool
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
-    DEFAULT_BROWSER_CAPABILITIES,
-)
 from openjiuwen.harness.tools.subagent._control_registry import release_all_subagent_controls
 from openjiuwen.harness.tools.subagent.subagent_tools import build_subagent_tools
 
@@ -363,6 +360,10 @@ class SubagentRail(DeepAgentRail):
             tools_str = self._extract_agent_tools(spec, agent_name)
             lines.append(f"- {agent_name}: {agent_desc} (Tools: {tools_str})")
             if agent_name == "browser_agent":
+                from openjiuwen.harness.tools.browser_move.surfaces.browser.capabilities import (
+                    DEFAULT_BROWSER_CAPABILITIES,
+                )
+
                 lines.append("  Available Playwright capabilities:")
                 for capability in DEFAULT_BROWSER_CAPABILITIES:
                     tool_names = ", ".join(capability.tool_names)

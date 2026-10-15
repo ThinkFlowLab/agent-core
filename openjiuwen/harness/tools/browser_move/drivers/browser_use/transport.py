@@ -1,0 +1,318 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""NDJSON-over-stdio transport to the browser-use sidecar process; never imports ``browser_use``."""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import platform
+from pathlib import Path
+from typing import Any, Mapping
+
+from openjiuwen.core.common.logging import logger as _logger
+from openjiuwen.harness.tools.browser_move.drivers.browser_use.sidecar import exceptions as driver_errors
+from openjiuwen.harness.tools.browser_move.drivers.browser_use.sidecar import wire
+
+_SIDECAR_VENV_DIR = ".venvs/browser-use"
+_REQUEST_TIMEOUT_S = 30.0
+_SHUTDOWN_GRACE_S = 5.0
+
+_ERROR_CODE_TO_EXCEPTION: dict[str, type[driver_errors.DriverError]] = {
+    "DriverError": driver_errors.DriverError,
+    "DriverNotConnected": driver_errors.DriverNotConnected,
+    "DriverConnectionError": driver_errors.DriverConnectionError,
+    "DriverConnectionLost": driver_errors.DriverConnectionLost,
+    "ElementNotFound": driver_errors.ElementNotFound,
+    "AmbiguousElement": driver_errors.AmbiguousElement,
+    "StaleIndexError": driver_errors.StaleIndexError,
+    "StaleNodeError": driver_errors.StaleNodeError,
+    "ActionTimeout": driver_errors.ActionTimeout,
+    "NavigationError": driver_errors.NavigationError,
+    "ObserveError": driver_errors.ObserveError,
+    "EvaluateError": driver_errors.EvaluateError,
+    "DriverUnsupported": driver_errors.DriverUnsupported,
+    "ActionIntercepted": driver_errors.ActionIntercepted,
+}
+
+
+def _sidecar_dir() -> Path:
+    return Path(__file__).resolve().parent / "sidecar"
+
+
+def _default_venv_python() -> Path:
+    repo_root = Path(__file__).resolve().parents[6]
+    if platform.system() == "Windows":
+        return repo_root / _SIDECAR_VENV_DIR / "Scripts" / "python.exe"
+    return repo_root / _SIDECAR_VENV_DIR / "bin" / "python"
+
+
+def discover_sidecar_python(override: Path | None = None) -> Path:
+    """Resolve the sidecar interpreter path, or raise ``DriverUnsupported`` with a creation recipe."""
+    if override is not None:
+        if override.is_file():
+            return override
+        raise driver_errors.DriverUnsupported(
+            f"BROWSER_USE_SIDECAR_PYTHON={str(override)!r} does not point at an existing interpreter"
+        )
+
+    candidate = _default_venv_python()
+    if candidate.is_file():
+        return candidate
+
+    raise driver_errors.DriverUnsupported(
+        "No browser-use sidecar interpreter found. Create one with:\n"
+        "  uv venv --python 3.12 .venvs/browser-use\n"
+        '  uv pip install --python .venvs/browser-use "browser-use==0.13.10"\n'
+        "or set BROWSER_USE_SIDECAR_PYTHON to an existing interpreter."
+    )
+
+
+def _env_value(environ: Mapping[str, str], key: str) -> str | None:
+    value = environ.get(key)
+    return environ.get(key.upper()) if value is None else value
+
+
+def _sidecar_env(environ: Mapping[str, str], upload_root: Path | None) -> dict[str, str]:
+    """A minimal environment for the sidecar: no LLM credentials, ever."""
+    env: dict[str, str] = {}
+    for key in ("PATH",):
+        value = environ.get(key)
+        if value is not None:
+            env[key] = value
+    if platform.system() == "Windows":
+        for key in ("SystemRoot", "TEMP", "TMP", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "APPDATA"):
+            value = _env_value(environ, key)
+            if value is not None:
+                env[key] = value
+    else:
+        for key in ("HOME", "TMPDIR"):
+            value = environ.get(key)
+            if value is not None:
+                env[key] = value
+    for key, value in environ.items():
+        if key.startswith("BROWSER_USE_") and key != "BROWSER_USE_SIDECAR_PYTHON":
+            env[key] = value
+    if upload_root is not None:
+        env["BROWSER_UPLOAD_ROOT"] = str(upload_root)
+    env.setdefault("ANONYMIZED_TELEMETRY", "false")
+    return env
+
+
+class SidecarTransport:
+    """One live sidecar process plus its NDJSON request/response cycle."""
+
+    def __init__(
+        self,
+        *,
+        sidecar_python: Path | None = None,
+        upload_root: Path | None = None,
+        environ: Mapping[str, str] | None = None,
+    ) -> None:
+        self._sidecar_python = sidecar_python
+        self._upload_root = upload_root
+        self._environ = environ or {}
+        self._process: asyncio.subprocess.Process | None = None
+        self._next_id = 1
+        self._lock = asyncio.Lock()
+        self._hello: dict[str, Any] | None = None
+        self._closed = False
+        self._stderr_task: asyncio.Future[None] | None = None
+
+    @property
+    def hello(self) -> dict[str, Any] | None:
+        return self._hello
+
+    async def start(self, *, timeout_s: float = 30.0) -> dict[str, Any]:
+        """Spawn the sidecar and read its hello line."""
+        python_path = discover_sidecar_python(self._sidecar_python)
+        main_path = _sidecar_dir() / "main.py"
+        self._process = await asyncio.create_subprocess_exec(
+            str(python_path),
+            str(main_path),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=_sidecar_env(self._environ, self._upload_root),
+            limit=wire.MAX_LINE_BYTES,
+        )
+        self._stderr_task = asyncio.ensure_future(self._drain_stderr())
+
+        assert self._process.stdout is not None
+        try:
+            raw_line = await asyncio.wait_for(self._readline_stdout(), timeout=timeout_s)
+        except asyncio.TimeoutError as exc:
+            await self._terminate()
+            raise driver_errors.DriverConnectionError("sidecar did not send hello within timeout") from exc
+        except driver_errors.DriverConnectionLost as exc:
+            await self._terminate()
+            raise driver_errors.DriverConnectionError(str(exc)) from exc
+
+        if not raw_line:
+            await self._terminate()
+            raise driver_errors.DriverConnectionError("sidecar exited before sending hello")
+
+        try:
+            message = json.loads(raw_line.decode("utf-8").strip())
+        except json.JSONDecodeError as exc:
+            await self._terminate()
+            raise driver_errors.DriverConnectionError(f"sidecar hello line is not valid JSON: {raw_line!r}") from exc
+
+        if message.get("kind") != "hello":
+            await self._terminate()
+            raise driver_errors.DriverConnectionError(f"expected hello line, got: {message!r}")
+
+        if message.get("wire") != wire.WIRE_VERSION:
+            await self._terminate()
+            raise driver_errors.DriverConnectionError(
+                f"sidecar wire version {message.get('wire')!r} != expected {wire.WIRE_VERSION!r}"
+            )
+
+        self._hello = message
+        return message
+
+    async def request(
+        self, method: str, params: dict[str, Any] | None = None, *, timeout_s: float | None = None
+    ) -> Any:
+        """Send one request, await its matching reply. One in-flight request at a time."""
+        if self._process is None or self._process.stdin is None or self._process.stdout is None:
+            raise driver_errors.DriverNotConnected("sidecar transport has not been started")
+
+        async with self._lock:
+            request_id = self._next_id
+            self._next_id += 1
+            payload = wire.make_request(request_id, method, params)
+            line = json.dumps(payload, ensure_ascii=False) + "\n"
+
+            try:
+                self._process.stdin.write(line.encode("utf-8"))
+                await self._process.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError) as exc:
+                raise driver_errors.DriverConnectionLost("sidecar stdin pipe is closed") from exc
+
+            effective_timeout = timeout_s if timeout_s is not None else _REQUEST_TIMEOUT_S
+            try:
+                reply = await asyncio.wait_for(self._read_reply(request_id), timeout=effective_timeout)
+            except asyncio.TimeoutError:
+                await self._cancel(request_id)
+                raise driver_errors.ActionTimeout(f"{method} timed out after {effective_timeout}s") from None
+            except asyncio.CancelledError:
+                await self._cancel(request_id)
+                raise
+
+            return self._unwrap_reply(reply)
+
+    async def _readline_stdout(self) -> bytes:
+        assert self._process is not None and self._process.stdout is not None
+        try:
+            raw_line = await self._process.stdout.readline()
+        except asyncio.LimitOverrunError as exc:
+            raise driver_errors.DriverConnectionLost("sidecar emitted a line exceeding the max line size") from exc
+        except ValueError as exc:
+            if "chunk is longer than limit" not in str(exc):
+                raise
+            raise driver_errors.DriverConnectionLost("sidecar emitted a line exceeding the max line size") from exc
+        if raw_line and len(raw_line) > wire.MAX_LINE_BYTES:
+            raise driver_errors.DriverConnectionLost("sidecar emitted a line exceeding the max line size")
+        return raw_line
+
+    async def _read_reply(self, request_id: int) -> dict[str, Any]:
+        assert self._process is not None and self._process.stdout is not None
+        while True:
+            raw_line = await self._readline_stdout()
+            if not raw_line:
+                raise driver_errors.DriverConnectionLost("sidecar closed stdout unexpectedly")
+            try:
+                message = json.loads(raw_line.decode("utf-8").strip())
+            except json.JSONDecodeError:
+                _logger.warning("browser-use sidecar emitted a non-JSON line: %r", raw_line[:200])
+                continue
+
+            if message.get("kind") == "log":
+                self._forward_log(message)
+                continue
+            if message.get("kind") == "hello":
+                continue
+            if message.get("id") == request_id:
+                return message
+
+    async def _cancel(self, request_id: int) -> None:
+        if self._process is None or self._process.stdin is None:
+            return
+        try:
+            payload = wire.make_request(0, "cancel", {"id": request_id})
+            self._process.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+            await self._process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    @staticmethod
+    def _unwrap_reply(message: dict[str, Any]) -> Any:
+        if "ok" in message:
+            return message["ok"]
+        error = message.get("error") or {}
+        code = str(error.get("code", wire.DEFAULT_ERROR_CODE))
+        exc_class = _ERROR_CODE_TO_EXCEPTION.get(code, driver_errors.DriverError)
+        message_text = str(error.get("message", "sidecar error"))
+        data = error.get("data") or {}
+        if exc_class is driver_errors.EvaluateError:
+            raise driver_errors.EvaluateError(
+                message_text, js_message=str(data.get("js_message", "")), js_stack=str(data.get("js_stack", ""))
+            )
+        if exc_class is driver_errors.ActionIntercepted:
+            raise driver_errors.ActionIntercepted(message_text, by=str(data.get("by", "")))
+        raise exc_class(message_text)
+
+    def _forward_log(self, message: dict[str, Any]) -> None:
+        level_name = str(message.get("level", "info")).upper()
+        text = str(message.get("message", ""))
+        if level_name == "ERROR":
+            _logger.error("browser-use sidecar: %s", text)
+        elif level_name == "WARNING":
+            _logger.warning("browser-use sidecar: %s", text)
+        else:
+            _logger.info("browser-use sidecar: %s", text)
+
+    async def _drain_stderr(self) -> None:
+        if self._process is None or self._process.stderr is None:
+            return
+        while True:
+            raw_line = await self._process.stderr.readline()
+            if not raw_line:
+                break
+            text = raw_line.decode("utf-8", errors="replace").rstrip()
+            if text:
+                _logger.warning("browser-use sidecar stderr: %s", text)
+
+    async def close(self) -> None:
+        """Ask the sidecar to shut down, then terminate it if it does not exit in time."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._process is None:
+            return
+        try:
+            await self.request("shutdown", {}, timeout_s=_SHUTDOWN_GRACE_S)
+        except driver_errors.DriverError:
+            pass
+        await self._terminate()
+
+    async def _terminate(self) -> None:
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            self._stderr_task = None
+        if self._process is None:
+            return
+        if self._process.returncode is None:
+            try:
+                self._process.terminate()
+                await asyncio.wait_for(self._process.wait(), timeout=_SHUTDOWN_GRACE_S)
+            except asyncio.TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    self._process.kill()
+        self._process = None
+
+
+__all__ = ["SidecarTransport", "discover_sidecar_python"]

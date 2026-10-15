@@ -11,30 +11,33 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from openjiuwen.core.foundation.tool import McpServerConfig
-from openjiuwen.harness.tools.browser_move.clients.streamable_http_client import (
+from openjiuwen.harness.tools.browser_move.drivers.playwright_mcp.clients.streamable_http_client import (
     BrowserMoveStreamableHttpClient,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime import browser_tools as browser_tools_module
-from openjiuwen.harness.tools.browser_move.playwright_runtime.agents import (
+from openjiuwen.harness.tools.browser_move.runtime.agents import (
     ensure_execute_signature_compat,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools import (
-    build_browser_runtime_mcp_config,
-)
-from openjiuwen.harness.tools.browser_move.playwright_runtime.config import (
+from openjiuwen.harness.tools.browser_move.runtime.config import (
     DEFAULT_BROWSER_TIMEOUT_S,
     DEFAULT_GUARDRAIL_MAX_FAILURES,
     DEFAULT_GUARDRAIL_MAX_STEPS,
     DEFAULT_MODEL_NAME,
+)
+from openjiuwen.harness.tools.browser_move.runtime.utils.env import parse_command_args
+from openjiuwen.harness.tools.browser_move.runtime.utils.parsing import extract_json_object
+from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.server_config import (
+    build_browser_runtime_mcp_config,
+)
+from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.settings import (
     BrowserInstanceConfig,
+    browser_surface_settings,
     build_playwright_mcp_config,
     build_runtime_settings,
-    parse_command_args,
+    playwright_mcp_config,
 )
-from openjiuwen.harness.tools.browser_move.utils.parsing import extract_json_object
 
 
 def _run(coro: Any) -> Any:
@@ -112,6 +115,13 @@ def test_build_runtime_settings_respects_env_overrides() -> None:
 def test_build_playwright_mcp_config_enables_all_optional_capabilities_by_default() -> None:
     with patch.dict(os.environ, {}, clear=True):
         cfg = build_playwright_mcp_config()
+
+    assert cfg.params["args"][-1] == "--caps=pdf,vision,devtools,config,network,storage,testing"
+
+
+def test_playwright_mcp_config_enables_the_catalog_capabilities_in_catalog_order() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        cfg = playwright_mcp_config(browser_surface_settings())
 
     assert cfg.params["args"][-1] == "--caps=pdf,vision,devtools,config,network,storage,testing"
 
@@ -360,47 +370,18 @@ def test_execute_wrapper_preserves_non_none_tool_arguments() -> None:
     }
 
 
-def test_local_browser_runtime_server_logs_are_written_under_runtime_log_dir() -> None:
-    with tempfile.TemporaryDirectory() as tmp:
-        process = MagicMock()
-        process.poll.return_value = None
-        with (
-            patch.dict(os.environ, {"PLAYWRIGHT_RUNTIME_LOG_DIR": tmp}, clear=False),
-            patch.object(
-                browser_tools_module,
-                "_server_script",
-                return_value=Path(__file__),
-            ),
-            patch.object(
-                browser_tools_module,
-                "_build_child_env",
-                return_value={},
-            ),
-            patch.object(
-                browser_tools_module,
-                "_wait_port_open",
-                return_value=None,
-            ),
-            patch(
-                "openjiuwen.harness.tools.browser_move.playwright_runtime.browser_tools.subprocess.Popen",
-                return_value=process,
-            ) as mock_popen,
-        ):
-            getattr(browser_tools_module, "_start_local_server")("streamable-http", "127.0.0.1", 8940, "/mcp")
-            stdout_log = Path(tmp) / "browser_runtime_stdout.log"
-            stderr_log = Path(tmp) / "browser_runtime_stderr.log"
-            assert stdout_log.exists()
-            assert stderr_log.exists()
-            assert Path(mock_popen.call_args.kwargs["cwd"]).resolve() == Path.cwd().resolve()
-            browser_tools_module.stop_local_browser_runtime_server()
-
-        assert getattr(browser_tools_module, "_browser_runtime_stdout_handle") is None
-        assert getattr(browser_tools_module, "_browser_runtime_stderr_handle") is None
+def test_instance_launch_args_replace_the_environment_args() -> None:
+    """A caller that knows its launch flags passes them on the instance; the environment is not consulted."""
+    with patch.dict(os.environ, {"PLAYWRIGHT_MCP_ARGS": "-y @playwright/mcp@0.0.78 --headless"}, clear=True):
+        cfg = build_playwright_mcp_config(BrowserInstanceConfig(launch_args="-y @playwright/mcp@0.0.78 --isolated"))
+    assert cfg.params["args"][:3] == ["-y", "@playwright/mcp@0.0.78", "--isolated"]
+    assert "--headless" not in cfg.params["args"]
 
 
-# ---------------------------------------------------------------------------
-# Per-agent browser identity (BrowserInstanceConfig) — see plan: keyed server_id
-# ---------------------------------------------------------------------------
+def test_empty_instance_launch_args_fall_back_to_the_environment() -> None:
+    with patch.dict(os.environ, {"PLAYWRIGHT_MCP_ARGS": "-y @playwright/mcp@0.0.78 --headless"}, clear=True):
+        cfg = build_playwright_mcp_config(BrowserInstanceConfig(key="alpha", launch_args="  "))
+    assert cfg.params["args"][:3] == ["-y", "@playwright/mcp@0.0.78", "--headless"]
 
 
 def test_keyed_instance_suffixes_server_id() -> None:

@@ -22,10 +22,10 @@ from openjiuwen.core.single_agent.rail.base import AgentRail
 from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 from openjiuwen.harness.deep_agent import DeepAgent
 from openjiuwen.harness.schema.config import DeepAgentConfig
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import (
-    BrowserAgentRuntime,
-    BrowserRuntimeRail,
-)
+from openjiuwen.harness.tools.browser_move.contract import Effect, RunScript
+from openjiuwen.harness.tools.browser_move.runtime.session import ToolKind
+from openjiuwen.harness.tools.browser_move.surfaces.browser.rails.runtime_rail import BrowserRuntimeRail
+from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.facade import BrowserAgentRuntime
 from openjiuwen.harness.tools.subagent.task_tool import TaskTool, _run_subagent_with_observable_stream
 from tests.unit_tests.harness.test_deep_agent import FakeReactAgent, _create_dummy_model
 
@@ -230,7 +230,7 @@ async def test_real_browser_rail_stream_reaches_tasktool(monkeypatch, outcome):
     runtime.service.guardrails.timeout_s = 600
     runtime.service.build_failure_summary.return_value = "browser task incomplete"
     rail = BrowserRuntimeRail(runtime)
-    monkeypatch.setattr(rail, "_ensure_browser_mcp_ability", AsyncMock())
+    monkeypatch.setattr(rail, "_add_agent_parts", AsyncMock())
     browser.add_rail(rail)
     seen_sessions = []
 
@@ -262,6 +262,7 @@ async def test_real_browser_rail_stream_reaches_tasktool(monkeypatch, outcome):
                     "result": {"sel": "#weather", "text": "Singapore weather: high 33 C, low 26 C"},
                     "generation_id": "g1",
                 },
+                kind=ToolKind(action=RunScript("() => 1"), effect=RunScript.effect, progress=True, known=True),
                 tool_name="mcp_playwright-official_browser_evaluate",
                 tool_args={"function": "() => document.querySelector('#weather').textContent"},
             )
@@ -279,9 +280,10 @@ async def test_real_browser_rail_stream_reaches_tasktool(monkeypatch, outcome):
     parent = SimpleNamespace(create_subagent=lambda *_args, **_kwargs: browser)
     tool = TaskTool(card=ToolCard(id="terminal-task", name="task_tool"), parent_agent=parent)
     result = await tool.invoke(
-        {"subagent_type": "browser_agent", "task_description": (
-            "Report Singapore low_temperature" if outcome == "raw_weather" else "Read the title"
-        )},
+        {
+            "subagent_type": "browser_agent",
+            "task_description": ("Report Singapore low_temperature" if outcome == "raw_weather" else "Read the title"),
+        },
         session=Session(session_id="parent"),
     )
     assert result.success
@@ -338,7 +340,7 @@ async def test_focused_tasktool_resume_preserves_real_browser_requirements(monke
         runtime.service.guardrails.timeout_s = 600
         runtime.semantic_progress = {}
         rail = BrowserRuntimeRail(runtime)
-        monkeypatch.setattr(rail, "_ensure_browser_mcp_ability", AsyncMock())
+        monkeypatch.setattr(rail, "_add_agent_parts", AsyncMock())
         browser.add_rail(rail)
 
         async def call_model(ctx, _context, _tools):
@@ -353,8 +355,11 @@ async def test_focused_tasktool_resume_preserves_real_browser_requirements(monke
                 assert state["resume_count"] == 1
             extracted = {"product_rating": "4.8"} if observed_states else {"title": "Keyboard"}
             BrowserRuntimeRail._record_tool_evidence(
-                state, {"extracted": extracted, "generation_id": "g1"},
-                tool_name="browser_batch_interact", tool_args={},
+                state,
+                {"extracted": extracted, "generation_id": "g1"},
+                kind=ToolKind(effect=Effect.ACT, progress=True, known=True, helper=True),
+                tool_name="browser_batch_interact",
+                tool_args={},
             )
             ctx.session.update_state({"__browser_phase_budget_state__": state})
             observed_states.append(dict(state))
@@ -363,19 +368,30 @@ async def test_focused_tasktool_resume_preserves_real_browser_requirements(monke
         monkeypatch.setattr(browser.react_agent, "_call_model", call_model)
         return browser
 
-    tool = TaskTool(card=ToolCard(id="resume-test", name="task_tool"), parent_agent=SimpleNamespace(
-        create_subagent=create_browser,
-    ))
+    tool = TaskTool(
+        card=ToolCard(id="resume-test", name="task_tool"),
+        parent_agent=SimpleNamespace(
+            create_subagent=create_browser,
+        ),
+    )
     session = Session(session_id="resume-parent")
-    first = await tool.invoke({
-        "subagent_type": "browser_agent", "task_description": "Return product title and product_rating",
-    }, session=session)
+    first = await tool.invoke(
+        {
+            "subagent_type": "browser_agent",
+            "task_description": "Return product title and product_rating",
+        },
+        session=session,
+    )
     assert first.success
     assert first.data["browser_result"]["status"] == "partial"
-    second = await tool.invoke({
-        "subagent_type": "browser_agent", "task_description": "Only read the missing product rating",
-        "resume_task_id": first.data["resume_task_id"],
-    }, session=session)
+    second = await tool.invoke(
+        {
+            "subagent_type": "browser_agent",
+            "task_description": "Only read the missing product rating",
+            "resume_task_id": first.data["resume_task_id"],
+        },
+        session=session,
+    )
     assert second.success
     assert len(observed_states) == 2
     assert second.data["browser_result"]["status"] == "completed"

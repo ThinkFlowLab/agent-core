@@ -12,25 +12,66 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from openjiuwen.core.foundation.tool import McpServerConfig, ToolInfo
-from openjiuwen.core.foundation.llm import ToolCall
+from openjiuwen.core.foundation.llm import Model, ModelClientConfig, ModelRequestConfig, ToolCall
 from openjiuwen.core.foundation.llm.schema.message import ToolMessage, UserMessage
-from openjiuwen.core.runner import Runner
+from openjiuwen.core.runner.callback.errors import AbortError
 from openjiuwen.core.single_agent.ability_manager import AbilityManager
 from openjiuwen.core.single_agent.prompts.builder import SystemPromptBuilder
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities import (
+from openjiuwen.core.single_agent.rail.base import (
+    AgentCallbackContext,
+    AgentRail,
+    InvokeInputs,
+    ModelCallInputs,
+    ToolCallInputs,
+)
+from openjiuwen.harness.image_modality_probe import probe_cache_key, set_cached_image_support
+from openjiuwen.harness.tools.browser_move.contract import (
+    ActionResult,
+    ActionTimeout,
+    Click,
+    ConnectionLost,
+    DriverError,
+    DriverInfo,
+    DriverRef,
+    Observe,
+    RunScript,
+    StaleRef,
+)
+from openjiuwen.harness.tools.browser_move.contract.testing import FakeDriver
+from openjiuwen.harness.tools.browser_move.contract.testing.fake import DEFAULT_ACTIONS
+from openjiuwen.harness.tools.browser_move.runtime import session as runtime_module
+from openjiuwen.harness.tools.browser_move.runtime.tool_factory import CommandRecord, command_record
+from openjiuwen.harness.tools.browser_move.runtime.worker import MAX_ITERATION_MESSAGE
+from openjiuwen.harness.tools.browser_move.surfaces.browser.capabilities import (
     CORE_BROWSER_TOOL_NAMES,
     resolve_browser_capabilities,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_working_context import (
+from openjiuwen.harness.tools.browser_move.surfaces.browser.commands import Navigate
+from openjiuwen.harness.tools.browser_move.surfaces.browser.rails import runtime_rail as rail_module
+from openjiuwen.harness.tools.browser_move.surfaces.browser.rails.runtime_rail import BrowserRuntimeRail
+from openjiuwen.harness.tools.browser_move.surfaces.browser.runner import facade as facade_module
+from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.facade import BrowserAgentRuntime
+from openjiuwen.harness.tools.browser_move.surfaces.browser.working_context.store import (
     BrowserWorkingContextStore,
 )
-from openjiuwen.harness.tools.browser_move.playwright_runtime import runtime as runtime_module
-from openjiuwen.harness.tools.browser_move.playwright_runtime.runtime import BrowserAgentRuntime, BrowserRuntimeRail
-from openjiuwen.harness.tools.browser_move.playwright_runtime.service import MAX_ITERATION_MESSAGE
-from openjiuwen.harness.tools.base_tool import ToolOutput
-from openjiuwen.core.single_agent.rail.base import AgentCallbackContext, AgentRail
-from openjiuwen.core.single_agent.rail.base import InvokeInputs, ModelCallInputs, ToolCallInputs
+from tests.unit_tests.harness.tools.browser_move.runtime_fixtures import (
+    BATCH,
+    MCP_PREFIX,
+    PROBE,
+    RECALL,
+    command_kind,
+    element,
+    make_runtime,
+    mcp_fake_driver,
+    observation,
+    result,
+)
+
+CLICK = MCP_PREFIX + "browser_click"
+NAVIGATE = MCP_PREFIX + "browser_navigate"
+SNAPSHOT = MCP_PREFIX + "browser_snapshot"
+EVALUATE = MCP_PREFIX + "browser_evaluate"
+DRAG = MCP_PREFIX + "browser_drag"
 
 
 def _run(coro):
@@ -39,17 +80,9 @@ def _run(coro):
 
 def _make_ctx() -> AgentCallbackContext:
     agent = MagicMock()
-    agent.deep_config = SimpleNamespace(enable_read_image_multimodal=True)
+    agent.deep_config = SimpleNamespace(enable_read_image_multimodal=True, language="en")
+    agent.register_rail = AsyncMock()
     return AgentCallbackContext(agent=agent)
-
-
-def _playwright_mcp_config() -> McpServerConfig:
-    return McpServerConfig(
-        server_id="playwright_official_stdio",
-        server_name="playwright-official",
-        server_path="stdio://playwright",
-        client_type="stdio",
-    )
 
 
 class _FakeSession:
@@ -67,13 +100,37 @@ class _FakeSession:
         self._state.update(payload)
 
 
-def _make_bare_runtime() -> BrowserAgentRuntime:
-    runtime = BrowserAgentRuntime.__new__(BrowserAgentRuntime)
-    runtime._page_generation = 0
-    runtime._reference_generations = {}
-    runtime._selector_primary_links = {}
-    runtime._last_observed_url = ""
+def _mock_runtime() -> MagicMock:
+    runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime.tool_kind.return_value = runtime_module.ToolKind()
     return runtime
+
+
+def _tools(runtime: BrowserAgentRuntime) -> dict:
+    return {tool.card.name: tool for tool in runtime.agent_parts(image_support=False, language="en").tools}
+
+
+def _invoke(runtime: BrowserAgentRuntime, name: str, args: dict):
+    return _run(_tools(runtime)[name].invoke(args))
+
+
+def _tool_ctx(runtime: BrowserAgentRuntime, name: str, args: dict, output, *, session=None) -> AgentCallbackContext:
+    content = output.data["content"] if output.data else output.error
+    text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+    return AgentCallbackContext(
+        agent=MagicMock(),
+        session=session,
+        inputs=ToolCallInputs(
+            tool_name=name,
+            tool_args=args,
+            tool_result=output,
+            tool_msg=ToolMessage(tool_call_id=f"{name}-call", content=text),
+        ),
+    )
+
+
+def _added_names(ctx: AgentCallbackContext) -> set[str]:
+    return {call.args[0].name for call in ctx.agent.ability_manager.add_ability.call_args_list}
 
 
 def test_rail_is_agent_rail_subclass() -> None:
@@ -93,121 +150,96 @@ def test_reset_active_browser_runtimes_resets_all_live_instances() -> None:
 
     first = _Runtime()
     second = _Runtime()
-    runtime_module._ACTIVE_BROWSER_RUNTIMES.clear()
-    runtime_module._ACTIVE_BROWSER_RUNTIMES.add(first)
-    runtime_module._ACTIVE_BROWSER_RUNTIMES.add(second)
+    facade_module._ACTIVE_BROWSER_RUNTIMES.clear()
+    facade_module._ACTIVE_BROWSER_RUNTIMES.add(first)
+    facade_module._ACTIVE_BROWSER_RUNTIMES.add(second)
 
-    assert _run(runtime_module.reset_active_browser_runtimes()) == 2
+    assert _run(facade_module.reset_active_browser_runtimes()) == 2
     first.reset.assert_awaited_once()
     second.reset.assert_awaited_once()
-    runtime_module._ACTIVE_BROWSER_RUNTIMES.clear()
+    facade_module._ACTIVE_BROWSER_RUNTIMES.clear()
 
 
 def test_before_invoke_calls_ensure_runtime_ready() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime = make_runtime(image_support=None)
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime.service = MagicMock()
-    runtime.service.mcp_cfg = MagicMock()
-    runtime.service.allowed_tool_names = ("browser_click", "browser_pdf_save")
     rail = BrowserRuntimeRail(runtime)
     ctx = _make_ctx()
-    ctx.agent.ability_manager = MagicMock()
+
     _run(rail.before_invoke(ctx))
+
     runtime.ensure_runtime_ready.assert_called_once_with()
-    ctx.agent.ability_manager.add.assert_called_once_with(runtime.service.mcp_cfg)
-    ctx.agent.ability_manager.set_mcp_tool_allowlist.assert_called_once_with(
-        runtime.service.mcp_cfg,
-        runtime.service.allowed_tool_names,
-    )
+    parts = runtime.agent_parts(image_support=True, language="en")
+    assert _added_names(ctx) == {tool.card.name for tool in parts.tools}
+    ctx.agent.register_rail.assert_not_awaited()
+
+
+def test_before_invoke_builds_the_parts_in_the_agents_language() -> None:
+    runtime = make_runtime(image_support=None)
+    runtime.ensure_runtime_ready = AsyncMock()
+    rail = BrowserRuntimeRail(runtime)
+    ctx = _make_ctx()
+    ctx.agent.deep_config.language = "cn"
+
+    with patch.object(runtime, "agent_parts", wraps=runtime.agent_parts) as parts:
+        _run(rail.before_invoke(ctx))
+
+    parts.assert_called_once_with(image_support=True, language="cn")
 
 
 def test_before_invoke_with_none_allowlist_defaults_to_core() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    runtime.ensure_runtime_ready = AsyncMock()
-    runtime.service = MagicMock()
-    runtime.service.mcp_cfg = MagicMock()
-    runtime.service.allowed_tool_names = None
+    runtime = make_runtime(allowed_tool_names=None, image_support=None)
     rail = BrowserRuntimeRail(runtime)
     ctx = _make_ctx()
-    ctx.agent.ability_manager = MagicMock()
 
     _run(rail.before_invoke(ctx))
 
-    ctx.agent.ability_manager.add.assert_called_once_with(runtime.service.mcp_cfg)
-    ctx.agent.ability_manager.set_mcp_tool_allowlist.assert_called_once_with(
-        runtime.service.mcp_cfg,
-        CORE_BROWSER_TOOL_NAMES,
-    )
+    names = _added_names(ctx)
+    assert {MCP_PREFIX + name for name in CORE_BROWSER_TOOL_NAMES} <= names
+    helpers = {"browser_probe_interactives", "browser_probe_cards", "browser_batch_interact", "browser_recall_offload"}
+    assert helpers <= names
+    assert MCP_PREFIX + "browser_pdf_save" not in names
 
 
 def test_before_invoke_removes_screenshot_for_non_multimodal_model() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    runtime.ensure_runtime_ready = AsyncMock()
-    runtime.service = MagicMock()
-    runtime.service.mcp_cfg = _playwright_mcp_config()
-    runtime.service.allowed_tool_names = (
-        "browser_click",
-        "browser_take_screenshot",
-        "browser_snapshot",
-    )
+    allowed = resolve_browser_capabilities(["vision"]).allowed_tool_names
+    runtime = make_runtime(allowed_tool_names=allowed, image_support=None)
     rail = BrowserRuntimeRail(runtime)
     ctx = _make_ctx()
     ctx.agent.deep_config.enable_read_image_multimodal = False
-    ctx.agent.ability_manager = MagicMock()
 
     _run(rail.before_invoke(ctx))
 
-    ctx.agent.ability_manager.set_mcp_tool_allowlist.assert_called_once_with(
-        runtime.service.mcp_cfg,
-        ("browser_click", "browser_snapshot"),
-    )
+    names = _added_names(ctx)
+    assert MCP_PREFIX + "browser_take_screenshot" not in names
+    assert {MCP_PREFIX + "browser_click", MCP_PREFIX + "browser_mouse_click_xy"} <= names
 
 
 def test_before_invoke_builds_non_multimodal_allowlist_from_core() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    runtime.ensure_runtime_ready = AsyncMock()
-    runtime.service = MagicMock()
-    runtime.service.mcp_cfg = _playwright_mcp_config()
-    runtime.service.allowed_tool_names = None
+    runtime = make_runtime(allowed_tool_names=None, image_support=None)
     rail = BrowserRuntimeRail(runtime)
     ctx = _make_ctx()
     ctx.agent.deep_config.enable_read_image_multimodal = False
-    ctx.agent.ability_manager = MagicMock()
+
     _run(rail.before_invoke(ctx))
 
-    ctx.agent.ability_manager.set_mcp_tool_allowlist.assert_called_once_with(
-        runtime.service.mcp_cfg,
-        tuple(tool_name for tool_name in CORE_BROWSER_TOOL_NAMES if tool_name != "browser_take_screenshot"),
-    )
+    core = {MCP_PREFIX + name for name in CORE_BROWSER_TOOL_NAMES} - {MCP_PREFIX + "browser_take_screenshot"}
+    assert core <= _added_names(ctx)
+    assert not any("screenshot" in name for name in _added_names(ctx))
 
 
 def test_pdf_allowlist_filters_active_browser_agent_schemas() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    runtime.ensure_runtime_ready = AsyncMock()
-    runtime.service = MagicMock()
-    runtime.service.mcp_cfg = _playwright_mcp_config()
-    runtime.service.allowed_tool_names = resolve_browser_capabilities(["pdf"]).allowed_tool_names
+    allowed = resolve_browser_capabilities(["pdf"]).allowed_tool_names
+    runtime = make_runtime(allowed_tool_names=allowed, image_support=None)
     rail = BrowserRuntimeRail(runtime)
     agent = MagicMock()
     agent.ability_manager = AbilityManager()
+    agent.register_rail = AsyncMock()
     ctx = AgentCallbackContext(agent=agent)
 
     _run(rail.before_invoke(ctx))
 
-    registered_tools = [
-        ToolInfo(name="browser_click", description="core", parameters={}),
-        ToolInfo(name="browser_pdf_save", description="pdf", parameters={}),
-        ToolInfo(name="browser_get_config", description="config", parameters={}),
-        ToolInfo(name="browser_cookie_list", description="storage", parameters={}),
-        ToolInfo(name="browser_mouse_click_xy", description="vision", parameters={}),
-    ]
-    with patch.object(
-        Runner.resource_mgr,
-        "get_mcp_tool_infos",
-        new=AsyncMock(return_value=registered_tools),
-    ):
-        visible_names = {tool.name for tool in _run(agent.ability_manager.list_tool_info())}
-
+    visible_names = {tool.name for tool in _run(agent.ability_manager.list_tool_info())}
     assert "mcp_playwright-official_browser_click" in visible_names
     assert "mcp_playwright-official_browser_pdf_save" in visible_names
     assert "mcp_playwright-official_browser_get_config" not in visible_names
@@ -216,37 +248,43 @@ def test_pdf_allowlist_filters_active_browser_agent_schemas() -> None:
 
 
 def test_before_invoke_called_twice_delegates_twice() -> None:
-    """Idempotency is BrowserAgentRuntime's responsibility; rail always delegates."""
-    runtime = MagicMock(spec=BrowserAgentRuntime)
+    """The tools are added on every invoke; the rail registers no rail (they are queued at construction)."""
+    runtime = make_runtime(image_support=None)
     runtime.ensure_runtime_ready = AsyncMock()
-    runtime.service = MagicMock()
-    runtime.service.mcp_cfg = MagicMock()
-    runtime.service.allowed_tool_names = ("browser_click", "browser_pdf_save")
     rail = BrowserRuntimeRail(runtime)
     ctx1 = _make_ctx()
-    ctx1.agent.ability_manager = MagicMock()
-    ctx2 = _make_ctx()
-    ctx2.agent.ability_manager = MagicMock()
+    ctx2 = AgentCallbackContext(agent=ctx1.agent)
+
     _run(rail.before_invoke(ctx1))
     _run(rail.before_invoke(ctx2))
+
     assert runtime.ensure_runtime_ready.call_count == 2
-    ctx1.agent.ability_manager.set_mcp_tool_allowlist.assert_called_once_with(
-        runtime.service.mcp_cfg,
-        runtime.service.allowed_tool_names,
-    )
-    ctx2.agent.ability_manager.set_mcp_tool_allowlist.assert_called_once_with(
-        runtime.service.mcp_cfg,
-        runtime.service.allowed_tool_names,
-    )
+    parts = runtime.agent_parts(image_support=True, language="en")
+    assert ctx1.agent.ability_manager.add_ability.call_count == 2 * len(parts.tools)
+    assert ctx1.agent.register_rail.await_count == 0
+
+
+def test_a_session_that_cannot_start_aborts_the_invoke_before_any_tool_is_added() -> None:
+    runtime = make_runtime(image_support=None)
+    error = ConnectionLost("connect: no device", dispatched=False)
+    runtime.ensure_runtime_ready = AsyncMock(side_effect=error)
+    rail = BrowserRuntimeRail(runtime)
+    ctx = _make_ctx()
+
+    with pytest.raises(AbortError) as raised:
+        _run(rail.before_invoke(ctx))
+
+    assert (raised.value.cause, raised.value.reason) == (error, "connect: no device")
+    ctx.agent.ability_manager.add_ability.assert_not_called()
+    ctx.agent.register_rail.assert_not_awaited()
 
 
 def test_before_tool_call_normalizes_explicit_snapshot_ref_target() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    rail = BrowserRuntimeRail(runtime)
+    rail = BrowserRuntimeRail(make_runtime())
     ctx = AgentCallbackContext(
         agent=MagicMock(),
         inputs=ToolCallInputs(
-            tool_name="mcp_playwright-official_browser_click",
+            tool_name=CLICK,
             tool_args={
                 "target": "ref=f2e36",
                 "ref": "[ref=f2e36]",
@@ -263,49 +301,16 @@ def test_before_tool_call_normalizes_explicit_snapshot_ref_target() -> None:
     }
 
 
-def test_before_tool_call_canonicalizes_playwright_official_server_separator() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    rail = BrowserRuntimeRail(runtime)
-    ctx = AgentCallbackContext(
-        agent=MagicMock(),
-        inputs=ToolCallInputs(
-            tool_name="mcp_playwright-official-browser_evaluate",
-            tool_args={"function": "() => document.title"},
-        ),
-    )
-
-    _run(rail.before_tool_call(ctx))
-
-    assert ctx.inputs.tool_name == "mcp_playwright-official_browser_evaluate"
-
-
-def test_before_tool_call_canonicalizes_bare_mcp_tool_name() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    runtime.service.allowed_tool_names = ("browser_navigate",)
-    runtime.service.mcp_cfg.server_name = "playwright-official"
-    runtime.semantic_progress = {}
-    rail = BrowserRuntimeRail(runtime)
-    ctx = AgentCallbackContext(
-        agent=MagicMock(),
-        inputs=ToolCallInputs(
-            tool_call=ToolCall(id="navigate-1", type="function", name="browser_navigate", arguments="{}"),
-            tool_name="browser_navigate",
-            tool_args={"url": "https://example.com"},
-        ),
-    )
-
-    _run(rail.before_tool_call(ctx))
-
-    assert ctx.inputs.tool_name == "mcp_playwright-official_browser_navigate"
+def _drag_runtime() -> BrowserAgentRuntime:
+    return make_runtime(allowed_tool_names=resolve_browser_capabilities(["extended_interaction"]).allowed_tool_names)
 
 
 def test_before_tool_call_normalizes_bracketed_refs_in_json_arguments() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    rail = BrowserRuntimeRail(runtime)
+    rail = BrowserRuntimeRail(_drag_runtime())
     ctx = AgentCallbackContext(
         agent=MagicMock(),
         inputs=ToolCallInputs(
-            tool_name="mcp_playwright-official_browser_drag",
+            tool_name=DRAG,
             tool_args=('{"startTarget": "[ref=f1e2]", "endTarget": "ref=f1e9", "element": "card"}'),
         ),
     )
@@ -317,12 +322,11 @@ def test_before_tool_call_normalizes_bracketed_refs_in_json_arguments() -> None:
 
 
 def test_before_tool_call_rewrites_direct_mcp_ref_aliases() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    rail = BrowserRuntimeRail(runtime)
+    rail = BrowserRuntimeRail(_drag_runtime())
     ctx = AgentCallbackContext(
         agent=MagicMock(),
         inputs=ToolCallInputs(
-            tool_name="mcp_playwright-official_browser_drag",
+            tool_name=DRAG,
             tool_args={
                 "startRef": "[ref=f1e2]",
                 "endRef": "ref=f1e9",
@@ -336,18 +340,16 @@ def test_before_tool_call_rewrites_direct_mcp_ref_aliases() -> None:
     assert ctx.inputs.tool_args == {
         "startTarget": "f1e2",
         "endTarget": "f1e9",
-        "element": "card",
     }
 
 
 def test_before_tool_call_preserves_css_selector_targets() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    rail = BrowserRuntimeRail(runtime)
+    rail = BrowserRuntimeRail(make_runtime())
     args = {"target": "#search-input", "element": "search input"}
     ctx = AgentCallbackContext(
         agent=MagicMock(),
         inputs=ToolCallInputs(
-            tool_name="mcp_playwright-official_browser_click",
+            tool_name=CLICK,
             tool_args=args,
         ),
     )
@@ -358,28 +360,40 @@ def test_before_tool_call_preserves_css_selector_targets() -> None:
 
 
 def test_before_tool_call_rewrites_card_primary_link_click_to_navigation() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    runtime.resolve_primary_link.return_value = "https://example.com/item/1"
+    runtime = make_runtime()
+    runtime.page_state.selector_primary_links[".result-card:nth-of-type(1)"] = (0, "https://example.com/item/1")
     rail = BrowserRuntimeRail(runtime)
     ctx = AgentCallbackContext(
         agent=MagicMock(),
         inputs=ToolCallInputs(
-            tool_name="mcp_playwright-official_browser_click",
-            tool_args={"selector": ".result-card:nth-of-type(1)"},
+            tool_name=CLICK,
+            tool_args={"target": ".result-card:nth-of-type(1)", "element": "card"},
         ),
     )
 
     _run(rail.before_tool_call(ctx))
 
-    assert ctx.inputs.tool_name == "mcp_playwright-official_browser_navigate"
+    assert ctx.inputs.tool_name == NAVIGATE
     assert ctx.inputs.tool_args == {"url": "https://example.com/item/1"}
 
 
+def test_before_tool_call_leaves_the_browser_dialects_ref_and_generation_alone() -> None:
+    driver = FakeDriver(info=DriverInfo(name="fake", surfaces=frozenset({"browser"}), actions=DEFAULT_ACTIONS))
+    rail = BrowserRuntimeRail(make_runtime(driver))
+    arguments = {"ref": "bnid:8", "generation_id": "g0"}
+    ctx = AgentCallbackContext(
+        agent=MagicMock(), inputs=ToolCallInputs(tool_name="browser_click", tool_args=dict(arguments))
+    )
+
+    _run(rail.before_tool_call(ctx))
+
+    assert (ctx.inputs.tool_name, ctx.inputs.tool_args) == ("browser_click", arguments)
+
+
 def test_before_tool_call_rejects_batch_screenshot_without_image_support() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    rail = BrowserRuntimeRail(runtime)
+    rail = BrowserRuntimeRail(make_runtime())
     agent = MagicMock()
-    agent.deep_config = SimpleNamespace(enable_read_image_multimodal=False)
+    agent.deep_config = SimpleNamespace(enable_read_image_multimodal=False, language="en")
     ctx = AgentCallbackContext(
         agent=agent,
         inputs=ToolCallInputs(
@@ -401,44 +415,52 @@ def test_before_tool_call_rejects_batch_screenshot_without_image_support() -> No
     assert ctx.extra["_skip_tool_calls"]
 
 
-def test_navigation_invalidates_snapshot_refs_from_older_generation() -> None:
-    runtime = _make_bare_runtime()
-    runtime.record_tool_reference_state(
-        tool_name="mcp_playwright_browser_snapshot",
-        tool_args={},
-        tool_result='textbox "Search" [ref=f1e2]',
+def test_a_ref_from_before_a_navigation_reaches_the_driver_and_the_server_refuses_it() -> None:
+    driver = mcp_fake_driver(
+        observations=[observation([element("f1e2", "textbox", "Search")])],
+        results=[result(url="https://example.com/results", context_changed=True)],
     )
+    runtime = make_runtime(driver)
 
-    runtime.validate_reference_values(("f1e2",))
+    assert _invoke(runtime, SNAPSHOT, {}).success is True
     assert runtime.generation_id == "g0"
 
-    runtime.record_tool_reference_state(
-        tool_name="mcp_playwright_browser_navigate",
-        tool_args={"url": "https://example.com/results"},
-        tool_result={"ok": True, "url": "https://example.com/results"},
-    )
+    assert _invoke(runtime, NAVIGATE, {"url": "https://example.com/results"}).success is True
 
     assert runtime.generation_id == "g1"
-    with pytest.raises(ValueError, match="older page generation"):
-        runtime.validate_reference_values(("f1e2",))
+    fresh = observation([element("e3", "link", "First result")], url="https://example.com/results")
+    driver.fail_next(StaleRef("Ref f1e2 not found in the current page snapshot.", observation=fresh))
+    stale = _invoke(runtime, CLICK, {"target": "f1e2"})
+    assert stale.success is False
+    assert "Ref f1e2 not found in the current page snapshot." in stale.error
+    assert "[ref=e3]" in stale.error
+    assert driver.kinds() == ["observe", "execute", "execute"]
+    assert driver.calls[-1].payload == Click(DriverRef("f1e2", ""))
+
+
+def test_a_ref_from_before_a_url_change_reaches_the_driver_again() -> None:
+    driver = mcp_fake_driver(
+        observations=[observation([element("e7", "link", "Result")], url="https://example.com/")],
+        results=[result(url="https://example.com/result/7"), result(url="https://example.com/result/7")],
+    )
+    runtime = make_runtime(driver)
+
+    _invoke(runtime, SNAPSHOT, {})
+    assert _invoke(runtime, CLICK, {"target": "e7"}).success is True
+
+    assert runtime.generation_id == "g1"
+    assert _invoke(runtime, CLICK, {"target": "e7"}).success is True
+    assert driver.kinds() == ["observe", "execute", "execute"]
+    assert runtime.generation_id == "g1"
 
 
 def test_after_snapshot_attaches_compact_page_state_to_tool_message() -> None:
-    runtime = _make_bare_runtime()
+    runtime = make_runtime(mcp_fake_driver(observations=[observation([element("f1e2", "textbox", "Search")])]))
     rail = BrowserRuntimeRail(runtime)
-    tool_message = ToolMessage(
-        tool_call_id="snapshot-call",
-        content='textbox "Search" [ref=f1e2]',
-    )
-    ctx = AgentCallbackContext(
-        agent=MagicMock(),
-        inputs=ToolCallInputs(
-            tool_name="mcp_playwright_browser_snapshot",
-            tool_args={},
-            tool_result='textbox "Search" [ref=f1e2]',
-            tool_msg=tool_message,
-        ),
-    )
+    output = _invoke(runtime, SNAPSHOT, {})
+    ctx = _tool_ctx(runtime, SNAPSHOT, {}, output)
+    tool_message = ctx.inputs.tool_msg
+    assert "[ref=f1e2]" in tool_message.content
 
     _run(rail.after_tool_call(ctx))
 
@@ -449,101 +471,47 @@ def test_after_snapshot_attaches_compact_page_state_to_tool_message() -> None:
     assert '"ref":"f1e2"' not in tool_message.content
 
 
-def test_click_result_url_change_invalidates_snapshot_refs() -> None:
-    runtime = _make_bare_runtime()
-    runtime._last_observed_url = "https://example.com/"
-    runtime.record_tool_reference_state(
-        tool_name="mcp_playwright_browser_snapshot",
-        tool_args={},
-        tool_result='link "Result" [ref=e7]',
-    )
-
-    runtime.record_tool_reference_state(
-        tool_name="mcp_playwright_browser_click",
-        tool_args={"ref": "e7"},
-        tool_result="Page URL: https://example.com/result/7",
-    )
-
-    assert runtime.generation_id == "g1"
-    with pytest.raises(ValueError, match="e7"):
-        runtime.validate_reference_values(("e7",))
-
-
-def test_first_observed_url_after_snapshot_invalidates_unknown_page_refs() -> None:
-    runtime = _make_bare_runtime()
-    runtime.record_tool_reference_state(
-        tool_name="mcp_playwright_browser_snapshot",
-        tool_args={},
-        tool_result='button "Open" [ref=e3]',
-    )
-
-    runtime.record_tool_reference_state(
-        tool_name="mcp_playwright_browser_click",
-        tool_args={"ref": "e3"},
-        tool_result="Page URL: https://example.com/opened",
-    )
-
-    assert runtime.generation_id == "g1"
-    with pytest.raises(ValueError, match="e3"):
-        runtime.validate_reference_values(("e3",))
-
-
 def test_card_primary_link_mapping_is_generation_scoped() -> None:
-    runtime = _make_bare_runtime()
-    runtime.register_card_primary_links(
-        {
-            "cards": [
-                {
-                    "selector_hint": ".card:nth-of-type(1)",
-                    "primary_link": "https://example.com/item/1",
-                }
-            ]
-        }
-    )
+    runtime = make_runtime()
+    page_state = runtime.page_state
+    page_state.selector_primary_links[".card:nth-of-type(1)"] = (page_state.generation, "https://example.com/item/1")
 
     assert runtime.resolve_primary_link({"selector": ".card:nth-of-type(1)"}) == "https://example.com/item/1"
 
-    runtime._advance_page_generation()
+    page_state.advance()
 
     assert runtime.resolve_primary_link({"selector": ".card:nth-of-type(1)"}) == ""
 
 
-def test_compact_rpc_wrapper_is_transparent_to_probe_parsing() -> None:
-    runtime = _make_bare_runtime()
-    raw = {
-        "__browser_compact_rpc__": True,
-        "payload": {"content": [{"type": "text", "text": '{"ok":true,"elements":[]}'}]},
-        "rpc_metrics": {"transport_invoke_elapsed_ms": 4},
-    }
-
-    assert runtime._unwrap_mcp_text_result(raw) == ('{"ok":true,"elements":[]}')
+def _click_record(error: DriverError | None = None, *, ok: bool = True) -> CommandRecord:
+    runtime = make_runtime()
+    action = Click(DriverRef("e4", "g0"))
+    if error is not None:
+        return CommandRecord.failed(action, error, runtime.page_state)
+    return CommandRecord.of(action, ActionResult(ok=ok, detail=None if ok else "### Error\nnot actionable"))
 
 
 @pytest.mark.parametrize(
-    ("result", "timed_out"),
+    ("record", "state_changed"),
     [
-        ("### Error\nlocator click timed out after 2500ms", True),
-        ({"content": [{"type": "text", "text": "Error: element is not actionable"}]}, False),
-        ({"ok": False, "error": "MCP request failed"}, False),
-        (
-            {
-                "ok": True,
-                "status": "completed",
-                "steps": [{"index": 1, "op": "click", "ok": False, "error": "not actionable"}],
-            },
-            False,
-        ),
+        (_click_record(ActionTimeout("locator click timed out after 2500ms", dispatched=True)), True),
+        (_click_record(DriverError("Error: element is not actionable", dispatched=True)), False),
+        (_click_record(DriverError("MCP request failed", dispatched=False)), False),
+        (_click_record(ok=False), False),
     ],
 )
-def test_tool_result_classifier_rejects_transport_error_shapes(result, timed_out: bool) -> None:
-    outcome = BrowserAgentRuntime.classify_tool_result(result)
+def test_tool_result_classifier_rejects_transport_error_shapes(record: CommandRecord, state_changed: bool) -> None:
+    kind = command_kind(record.action)
 
-    assert outcome["success"] is False
-    assert outcome["timed_out"] is timed_out
+    success, executed, changed = BrowserRuntimeRail._outcome(kind, record, None, {"ok": record.ok})
+
+    assert success is False
+    assert executed is record.dispatched
+    assert changed is state_changed
 
 
 def test_direct_mcp_target_id_is_resolved_and_runtime_fields_are_removed() -> None:
-    runtime = _make_bare_runtime()
+    runtime = make_runtime()
     payload = {
         "elements": [
             {
@@ -559,23 +527,19 @@ def test_direct_mcp_target_id_is_resolved_and_runtime_fields_are_removed() -> No
             }
         ]
     }
-    runtime._ensure_page_state().register_interactives(payload)
+    runtime.page_state.register_interactives(payload)
     target_id = payload["elements"][0]["target_id"]
     rail = BrowserRuntimeRail(runtime)
 
-    normalized = rail._normalize_playwright_ref_args(
-        "mcp_playwright-official_browser_click",
-        {"target_id": target_id, "generation_id": "g0"},
-    )
+    normalized = rail._normalize_target_args({"target_id": target_id, "generation_id": "g0"})
 
     assert normalized == {"target": "#search", "element": "Search"}
 
 
 def test_evaluate_runtime_field_contract_is_not_forwarded_to_mcp() -> None:
-    rail = BrowserRuntimeRail(_make_bare_runtime())
+    rail = BrowserRuntimeRail(make_runtime())
 
-    normalized = rail._normalize_playwright_ref_args(
-        "mcp_playwright-official_browser_evaluate",
+    normalized = rail._normalize_target_args(
         {
             "target": "document",
             "element": "page",
@@ -583,6 +547,7 @@ def test_evaluate_runtime_field_contract_is_not_forwarded_to_mcp() -> None:
             "field": "author",
             "fields": ["author", "comments"],
         },
+        frozenset({"target", "element", "function"}),
     )
 
     assert normalized == {
@@ -593,7 +558,7 @@ def test_evaluate_runtime_field_contract_is_not_forwarded_to_mcp() -> None:
 
 
 def test_direct_mcp_target_is_refreshed_when_runtime_identity_is_unique() -> None:
-    runtime = _make_bare_runtime()
+    runtime = make_runtime()
     first = {
         "elements": [
             {
@@ -606,9 +571,9 @@ def test_direct_mcp_target_is_refreshed_when_runtime_identity_is_unique() -> Non
             }
         ]
     }
-    runtime._ensure_page_state().register_interactives(first)
+    runtime.page_state.register_interactives(first)
     stale_target_id = first["elements"][0]["target_id"]
-    runtime._advance_page_generation()
+    runtime.page_state.advance()
     current = {
         "elements": [
             {
@@ -621,19 +586,16 @@ def test_direct_mcp_target_is_refreshed_when_runtime_identity_is_unique() -> Non
             }
         ]
     }
-    runtime._ensure_page_state().register_interactives(current)
+    runtime.page_state.register_interactives(current)
     rail = BrowserRuntimeRail(runtime)
 
-    normalized = rail._normalize_playwright_ref_args(
-        "mcp_playwright-official_browser_click",
-        {"target_id": stale_target_id, "generation_id": "g0"},
-    )
+    normalized = rail._normalize_target_args({"target_id": stale_target_id, "generation_id": "g0"})
 
     assert normalized == {"target": "#sales-sort", "element": "Sales"}
 
 
 def test_primary_link_target_is_rewritten_to_direct_navigation() -> None:
-    runtime = _make_bare_runtime()
+    runtime = make_runtime()
     payload = {
         "cards": [
             {
@@ -644,20 +606,20 @@ def test_primary_link_target_is_rewritten_to_direct_navigation() -> None:
             }
         ]
     }
-    runtime._ensure_page_state().register_cards(payload)
+    runtime.page_state.register_cards(payload)
     target_id = payload["cards"][0]["primary_link_target_id"]
     rail = BrowserRuntimeRail(runtime)
     ctx = AgentCallbackContext(
         agent=MagicMock(),
         inputs=ToolCallInputs(
-            tool_name="mcp_playwright-official_browser_click",
+            tool_name=CLICK,
             tool_args={"target_id": target_id, "generation_id": "g0"},
         ),
     )
 
     _run(rail.before_tool_call(ctx))
 
-    assert ctx.inputs.tool_name == "mcp_playwright-official_browser_navigate"
+    assert ctx.inputs.tool_name == NAVIGATE
     assert ctx.inputs.tool_args == {"url": "https://example.test/item/1"}
 
 
@@ -713,7 +675,8 @@ def test_known_url_must_be_navigated_before_selector_exploration() -> None:
     with pytest.raises(ValueError, match="Navigate to it directly"):
         BrowserRuntimeRail._consume_phase_budget(
             session,
-            "mcp_playwright_browser_snapshot",
+            command_kind(Observe()),
+            SNAPSHOT,
             {},
         )
 
@@ -727,7 +690,8 @@ def test_exhausted_phase_budget_requires_replan() -> None:
     with pytest.raises(ValueError, match="budget exhausted"):
         BrowserRuntimeRail._consume_phase_budget(
             session,
-            "mcp_playwright_browser_navigate",
+            command_kind(Navigate("https://www.baidu.com/s?wd=OpenJiuwen")),
+            NAVIGATE,
             {"url": "https://www.baidu.com/s?wd=OpenJiuwen"},
         )
 
@@ -760,7 +724,7 @@ def test_batch_phase_signature_changes_when_steps_change() -> None:
 
 def test_price_field_extraction_is_not_misclassified_as_filtering() -> None:
     phase = BrowserRuntimeRail._classify_tool_phase(
-        "browser_batch_interact",
+        BATCH,
         {
             "steps": [
                 {"op": "extract_text", "field": "price"},
@@ -800,6 +764,7 @@ def test_phase_attempts_do_not_reset_after_material_replan() -> None:
 
     action_class = BrowserRuntimeRail._consume_phase_budget(
         session,
+        BATCH,
         "browser_batch_interact",
         {"steps": [{"op": "click", "text": "100 to 200"}]},
     )
@@ -858,6 +823,7 @@ def test_new_evidence_clears_pending_semantic_replan_trial() -> None:
 
     delta = BrowserRuntimeRail._record_phase_result(
         session,
+        PROBE,
         "browser_probe_cards",
         {},
         {
@@ -916,14 +882,15 @@ def test_terminal_state_is_sticky_across_semantic_progress_and_worker_report() -
     with pytest.raises(ValueError, match="already blocked"):
         BrowserRuntimeRail._consume_phase_budget(
             session,
-            "browser_navigate",
+            command_kind(Navigate("https://example.test/again")),
+            NAVIGATE,
             {"url": "https://example.test/again"},
         )
 
 
 @pytest.mark.parametrize("status", ["blocked", "partial", "completed"])
 def test_terminal_state_returns_structured_denial(status: str) -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime = _mock_runtime()
     runtime.semantic_progress = {}
     rail = BrowserRuntimeRail(runtime)
     state = BrowserRuntimeRail._build_phase_state("inspect results")
@@ -963,6 +930,7 @@ def test_comparison_evidence_requires_distinct_bilibili_sort_slots() -> None:
     BrowserRuntimeRail._record_structured_evidence(
         state,
         comprehensive,
+        kind=PROBE,
         tool_name="browser_probe_cards",
         tool_args={},
     )
@@ -972,6 +940,7 @@ def test_comparison_evidence_requires_distinct_bilibili_sort_slots() -> None:
     BrowserRuntimeRail._record_structured_evidence(
         state,
         latest,
+        kind=PROBE,
         tool_name="browser_probe_cards",
         tool_args={},
     )
@@ -997,7 +966,7 @@ def test_retryable_model_failure_retries_once_then_returns_structured_error() ->
     ctx = AgentCallbackContext(
         agent=MagicMock(),
         session=session,
-        extra={"__browser_task_deadline__": runtime_module.time.monotonic() + 60},
+        extra={"__browser_task_deadline__": rail_module.time.monotonic() + 60},
         exception=RuntimeError("model_provider_response_error: code=504"),
     )
 
@@ -1069,14 +1038,14 @@ def test_worker_cannot_claim_completion_without_runtime_field_evidence() -> None
 
 
 @pytest.mark.parametrize(
-    ("tool_name", "tool_args"),
+    ("kind", "tool_name", "tool_args"),
     [
-        ("browser_snapshot", {}),
-        ("browser_probe_interactives", {"query": "next"}),
-        ("mcp_playwright-official_browser_find", {"text": "next"}),
+        (command_kind(Observe()), SNAPSHOT, {}),
+        (PROBE, "browser_probe_interactives", {"query": "next"}),
+        (PROBE, MCP_PREFIX + "browser_find", {"text": "next"}),
     ],
 )
-def test_target_discovery_gets_one_bounded_replan_recovery(tool_name, tool_args) -> None:
+def test_target_discovery_gets_one_bounded_replan_recovery(kind, tool_name, tool_args) -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("find the next control")
     state.update(
@@ -1089,11 +1058,11 @@ def test_target_discovery_gets_one_bounded_replan_recovery(tool_name, tool_args)
     )
     session.update_state({"__browser_phase_budget_state__": state})
 
-    action_class = BrowserRuntimeRail._consume_phase_budget(session, tool_name, tool_args)
+    action_class = BrowserRuntimeRail._consume_phase_budget(session, kind, tool_name, tool_args)
     assert action_class == "target_discovery"
 
     with pytest.raises(ValueError, match="already ran without verified semantic progress"):
-        BrowserRuntimeRail._consume_phase_budget(session, tool_name, tool_args)
+        BrowserRuntimeRail._consume_phase_budget(session, kind, tool_name, tool_args)
 
     assert session.get_state("__browser_phase_budget_state__")["replan_count"] == 1
 
@@ -1103,16 +1072,19 @@ def test_evaluate_result_becomes_compact_evidence_before_action_windowing() -> N
     state = BrowserRuntimeRail._build_phase_state("extract the title")
     session.update_state({"__browser_phase_budget_state__": state})
     function = "() => ({title: document.title, count: 3})"
+    kind = command_kind(RunScript(function))
 
     delta = BrowserRuntimeRail._record_phase_result(
         session,
-        "browser_evaluate",
+        kind,
+        EVALUATE,
         {"function": function, "target": "document"},
         {"ok": True, "result": {"title": "Example", "count": 3}, "generation_id": "g4"},
     )
     BrowserRuntimeRail._record_recent_action(
         session,
-        tool_name="browser_evaluate",
+        kind=kind,
+        tool_name=EVALUATE,
         tool_args={"function": function, "target": "document"},
         tool_result={"ok": True},
         action_class="script_exploration",
@@ -1132,9 +1104,7 @@ def test_evaluate_result_becomes_compact_evidence_before_action_windowing() -> N
 
 
 def test_targeted_evaluate_maps_only_requested_fields_with_provenance() -> None:
-    state = BrowserRuntimeRail._build_phase_state(
-        "返回文章作者、评论数和当前排序状态"
-    )
+    state = BrowserRuntimeRail._build_phase_state("返回文章作者、评论数和当前排序状态")
 
     BrowserRuntimeRail._record_structured_evidence(
         state,
@@ -1148,7 +1118,8 @@ def test_targeted_evaluate_maps_only_requested_fields_with_provenance() -> None:
                 "unrelatedCount": 99,
             },
         },
-        tool_name="browser_evaluate",
+        kind=command_kind(RunScript("() => ({})")),
+        tool_name=EVALUATE,
         tool_args={
             "target": ".article-author",
             "_runtime_evidence_fields": ["author", "comments", "sort_state"],
@@ -1181,7 +1152,8 @@ def test_ambiguous_evaluate_alias_requires_explicit_target_contract() -> None:
     BrowserRuntimeRail._record_structured_evidence(
         state,
         {"ok": True, "result": {"profileName": "Toolbar Account"}},
-        tool_name="browser_evaluate",
+        kind=command_kind(RunScript("() => ({})")),
+        tool_name=EVALUATE,
         tool_args={"target": "document"},
     )
 
@@ -1195,7 +1167,8 @@ def test_missing_evaluate_value_closes_slot_as_unavailable() -> None:
     BrowserRuntimeRail._record_structured_evidence(
         state,
         {"ok": True, "generation_id": "g3", "result": {"productRating": None}},
-        tool_name="browser_evaluate",
+        kind=command_kind(RunScript("() => ({})")),
+        tool_name=EVALUATE,
         tool_args={"target": ".product-rating"},
     )
 
@@ -1293,23 +1266,24 @@ def test_probe_contract_exposes_result_count_and_bounds_conflict_fallback() -> N
     assert second["diagnostics"]["recommended_fallback"] == "one_precise_probe"
     assert second["diagnostics"]["precise_fallback_remaining"] == 0
     assert second["page_state"]["classification_conflict"] is True
-    assert session.get_state("__browser_phase_budget_state__")[
-        "probe_classification_fallback_count"
-    ] == 1
+    assert session.get_state("__browser_phase_budget_state__")["probe_classification_fallback_count"] == 1
 
 
 def test_generation_or_selector_changes_do_not_create_new_semantic_evidence() -> None:
     session = _FakeSession()
     session.update_state({"__browser_phase_budget_state__": BrowserRuntimeRail._build_phase_state("extract title")})
+    kind = command_kind(RunScript("() => document.title"))
     first = BrowserRuntimeRail._record_phase_result(
         session,
-        "browser_evaluate",
+        kind,
+        EVALUATE,
         {"function": "() => document.title", "target": "ref=e1"},
         {"ok": True, "result": {"title": "Example"}, "generation_id": "g1"},
     )
     second = BrowserRuntimeRail._record_phase_result(
         session,
-        "browser_evaluate",
+        kind,
+        EVALUATE,
         {"function": "() => document.title", "target": "ref=e9"},
         {"ok": True, "result": {"title": "Example"}, "generation_id": "g2"},
     )
@@ -1326,7 +1300,8 @@ def test_recent_action_window_is_runtime_owned_and_bounded_to_six() -> None:
     for index in range(8):
         BrowserRuntimeRail._record_recent_action(
             session,
-            tool_name="browser_click",
+            kind=command_kind(Click(DriverRef(f"e{index}", "g0"))),
+            tool_name=CLICK,
             tool_args={"target_id": f"e{index}"},
             tool_result={"ok": True},
             action_class="interaction",
@@ -1348,6 +1323,7 @@ def test_same_price_interval_cannot_be_visited_twice() -> None:
     with pytest.raises(ValueError, match="already visited"):
         BrowserRuntimeRail._consume_phase_budget(
             session,
+            BATCH,
             "browser_batch_interact",
             {
                 "steps": [
@@ -1366,6 +1342,7 @@ def test_structured_extraction_records_task_scoped_evidence() -> None:
 
     BrowserRuntimeRail._record_phase_result(
         session,
+        BATCH,
         "browser_batch_interact",
         {"steps": [{"op": "extract_text", "field": "title"}]},
         {
@@ -1402,6 +1379,7 @@ def test_extraction_phase_waits_for_all_inferred_required_fields() -> None:
 
     BrowserRuntimeRail._record_phase_result(
         session,
+        BATCH,
         "browser_batch_interact",
         {"steps": [{"op": "extract_text", "field": "title"}]},
         {"ok": True, "extracted": {"title": "Headphones"}},
@@ -1412,6 +1390,7 @@ def test_extraction_phase_waits_for_all_inferred_required_fields() -> None:
 
     BrowserRuntimeRail._record_phase_result(
         session,
+        BATCH,
         "browser_batch_interact",
         {"steps": [{"op": "extract_text", "field": "price"}]},
         {"ok": True, "extracted": {"price": "$99"}},
@@ -1428,6 +1407,7 @@ def test_known_url_gate_allows_extraction_when_browser_is_already_on_target() ->
 
     action_class = BrowserRuntimeRail._consume_phase_budget(
         session,
+        PROBE,
         "browser_probe_cards",
         {},
         current_page_state={"url": "https://example.test/article?id=7", "title": "Article"},
@@ -1445,6 +1425,7 @@ def test_known_url_gate_guides_once_then_leaves_recovery_to_model() -> None:
     with pytest.raises(ValueError, match="https://example.test"):
         BrowserRuntimeRail._consume_phase_budget(
             session,
+            PROBE,
             "browser_probe_cards",
             {},
             current_page_state={"url": "about:blank"},
@@ -1452,6 +1433,7 @@ def test_known_url_gate_guides_once_then_leaves_recovery_to_model() -> None:
 
     action_class = BrowserRuntimeRail._consume_phase_budget(
         session,
+        PROBE,
         "browser_probe_cards",
         {},
         current_page_state={"url": "about:blank"},
@@ -1469,6 +1451,7 @@ def test_known_root_url_gate_accepts_deeper_same_site_page() -> None:
 
     action_class = BrowserRuntimeRail._consume_phase_budget(
         session,
+        PROBE,
         "browser_probe_cards",
         {},
         current_page_state={"url": "https://example.test/search?q=title"},
@@ -1488,7 +1471,7 @@ def test_replan_fingerprint_allows_a_different_requested_field() -> None:
     }
     title_strategy = BrowserRuntimeRail._strategy_fingerprint(
         state,
-        "browser_evaluate",
+        command_kind(RunScript(title_args["function"])),
         title_args,
         "script_exploration",
     )
@@ -1504,7 +1487,8 @@ def test_replan_fingerprint_allows_a_different_requested_field() -> None:
 
     action_class = BrowserRuntimeRail._consume_phase_budget(
         session,
-        "browser_evaluate",
+        command_kind(RunScript("() => ({price: document.querySelector('.price')?.textContent})")),
+        EVALUATE,
         {
             "function": "() => ({price: document.querySelector('.price')?.textContent})",
             "target": "ref=e9",
@@ -1536,21 +1520,21 @@ def test_strategy_fingerprint_tracks_semantic_target_without_generation_noise() 
 
     first = BrowserRuntimeRail._strategy_fingerprint(
         state,
-        "browser_batch_interact",
+        BATCH,
         {"steps": [{"op": "extract_text", "target_id": "t_g2_1", "field": "title"}]},
         "structured_extraction",
         first_page_state,
     )
     second = BrowserRuntimeRail._strategy_fingerprint(
         state,
-        "browser_batch_interact",
+        BATCH,
         {"steps": [{"op": "extract_text", "target_id": "t_g2_2", "field": "title"}]},
         "structured_extraction",
         first_page_state,
     )
     refreshed_first = BrowserRuntimeRail._strategy_fingerprint(
         state,
-        "browser_batch_interact",
+        BATCH,
         {"steps": [{"op": "extract_text", "target_id": "t_g3_9", "field": "title"}]},
         "structured_extraction",
         refreshed_page_state,
@@ -1564,9 +1548,10 @@ def test_repeated_replan_denials_become_terminal_after_finite_budget() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Extract the title")
     args = {"function": "() => document.querySelector('button').click()", "target": "ref=e1"}
+    kind = command_kind(RunScript(args["function"]))
     strategy = BrowserRuntimeRail._strategy_fingerprint(
         state,
-        "browser_evaluate",
+        kind,
         args,
         "script_exploration",
     )
@@ -1582,7 +1567,7 @@ def test_repeated_replan_denials_become_terminal_after_finite_budget() -> None:
 
     for _ in range(3):
         with pytest.raises(ValueError, match="Semantic loop detected"):
-            BrowserRuntimeRail._consume_phase_budget(session, "browser_evaluate", args)
+            BrowserRuntimeRail._consume_phase_budget(session, kind, EVALUATE, args)
 
     updated = session.get_state("__browser_phase_budget_state__")
     assert updated["status"] == "blocked"
@@ -1594,9 +1579,10 @@ def test_replan_allows_one_bounded_read_only_evidence_recovery() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Extract the title")
     args = {"function": "() => ({title: document.title})", "field": "title"}
+    kind = command_kind(RunScript(args["function"]))
     strategy = BrowserRuntimeRail._strategy_fingerprint(
         state,
-        "browser_evaluate",
+        kind,
         args,
         "script_exploration",
     )
@@ -1610,7 +1596,7 @@ def test_replan_allows_one_bounded_read_only_evidence_recovery() -> None:
     )
     session.update_state({"__browser_phase_budget_state__": state})
 
-    action_class = BrowserRuntimeRail._consume_phase_budget(session, "browser_evaluate", args)
+    action_class = BrowserRuntimeRail._consume_phase_budget(session, kind, EVALUATE, args)
 
     updated = session.get_state("__browser_phase_budget_state__")
     assert action_class == "script_exploration"
@@ -1632,6 +1618,7 @@ def test_offload_recall_does_not_consume_browser_phase_or_replan_budget() -> Non
 
     action_class = BrowserRuntimeRail._consume_phase_budget(
         session,
+        RECALL,
         "browser_recall_offload",
         {"handle": "audit-1", "query": "title"},
     )
@@ -1657,6 +1644,7 @@ def test_new_structured_evidence_recovers_pending_replan_trial() -> None:
 
     result = BrowserRuntimeRail._record_phase_result(
         session,
+        BATCH,
         "browser_batch_interact",
         {"steps": [{"op": "extract_text", "field": "title"}]},
         {"ok": True, "extracted": {"title": "Verified title"}},
@@ -1676,6 +1664,7 @@ def test_partial_batch_keeps_successful_extraction_without_marking_batch_success
 
     result = BrowserRuntimeRail._record_phase_result(
         session,
+        BATCH,
         "browser_batch_interact",
         {
             "steps": [
@@ -1702,19 +1691,25 @@ def test_partial_batch_keeps_successful_extraction_without_marking_batch_success
 
 
 def test_price_interval_ignores_evaluate_script_numbers() -> None:
-    assert BrowserRuntimeRail._price_interval_signature(
-        "browser_evaluate",
-        {"function": "() => [...document.querySelectorAll('.price')].slice(1, 2)"},
-    ) == ""
-    assert BrowserRuntimeRail._price_interval_signature(
-        "browser_batch_interact",
-        {
-            "steps": [
-                {"op": "fill", "field": "minimum price", "value": "100"},
-                {"op": "fill", "field": "maximum price", "value": "200"},
-            ]
-        },
-    ) == "100:200"
+    assert (
+        BrowserRuntimeRail._price_interval_signature(
+            command_kind(RunScript("() => [...document.querySelectorAll('.price')].slice(1, 2)")),
+            {"function": "() => [...document.querySelectorAll('.price')].slice(1, 2)"},
+        )
+        == ""
+    )
+    assert (
+        BrowserRuntimeRail._price_interval_signature(
+            BATCH,
+            {
+                "steps": [
+                    {"op": "fill", "field": "minimum price", "value": "100"},
+                    {"op": "fill", "field": "maximum price", "value": "200"},
+                ]
+            },
+        )
+        == "100:200"
+    )
 
 
 def test_required_field_ontology_and_generic_evidence_slots_keep_provenance() -> None:
@@ -1755,6 +1750,7 @@ def test_required_field_ontology_and_generic_evidence_slots_keep_provenance() ->
                 },
             },
         },
+        kind=BATCH,
         tool_name="browser_batch_interact",
         tool_args={},
     )
@@ -1773,9 +1769,10 @@ def test_required_field_ontology_and_generic_evidence_slots_keep_provenance() ->
 def test_required_fields_use_requested_output_clause_not_operation_preconditions() -> None:
     task = "打开淘宝搜索机械键盘，可以按价格或销量排序，返回第一条商品标题"
     assert BrowserRuntimeRail._infer_required_fields(task) == ["title"]
-    assert BrowserRuntimeRail._infer_required_fields(
-        "打开百度查看天气，返回最高温和最低温"
-    ) == ["high_temperature", "low_temperature"]
+    assert BrowserRuntimeRail._infer_required_fields("打开百度查看天气，返回最高温和最低温") == [
+        "high_temperature",
+        "low_temperature",
+    ]
     assert BrowserRuntimeRail._infer_required_fields("查询美元兑人民币并返回汇率") == ["exchange_rate"]
     assert BrowserRuntimeRail._infer_required_fields("搜索 Python 视频，返回播放量") == ["views"]
     assert BrowserRuntimeRail._infer_required_fields("打开淘宝把蓝牙耳机加入购物车") == []
@@ -1809,7 +1806,7 @@ def test_cart_action_feedback_is_sufficient_completion_evidence() -> None:
 
 
 def test_large_evaluate_observation_is_bounded() -> None:
-    rail = BrowserRuntimeRail(MagicMock(spec=BrowserAgentRuntime))
+    rail = BrowserRuntimeRail(_mock_runtime())
     tool_message = ToolMessage(
         content=json.dumps({"value": "x" * 20_000}),
         tool_call_id="evaluate-1",
@@ -1819,7 +1816,8 @@ def test_large_evaluate_observation_is_bounded() -> None:
 
     rail._compact_large_observation_message(
         inputs,
-        "mcp_playwright-official_browser_evaluate",
+        command_kind(RunScript("() => 1")),
+        EVALUATE,
         tool_result,
     )
 
@@ -1830,9 +1828,7 @@ def test_large_evaluate_observation_is_bounded() -> None:
 
 
 def test_comprehensive_and_latest_create_distinct_title_slots_without_compare_word() -> None:
-    slots = BrowserRuntimeRail._infer_required_evidence_slots(
-        "在B站分别切换综合排序和最新发布，返回两个标题"
-    )
+    slots = BrowserRuntimeRail._infer_required_evidence_slots("在B站分别切换综合排序和最新发布，返回两个标题")
     assert slots == [
         {"entity": "bilibili_search_result", "variant": "comprehensive", "field": "title"},
         {"entity": "bilibili_search_result", "variant": "latest", "field": "title"},
@@ -1883,7 +1879,7 @@ def test_unfinished_text_tool_intent_retries_once_in_same_task() -> None:
         session=session,
         inputs=ModelCallInputs(response=response),
     )
-    ctx.extra["__browser_task_deadline__"] = runtime_module.time.monotonic() + 60
+    ctx.extra["__browser_task_deadline__"] = rail_module.time.monotonic() + 60
     rail = BrowserRuntimeRail(runtime)
 
     _run(rail.after_model_call(ctx))
@@ -1911,7 +1907,7 @@ def test_invocation_slice_returns_retryable_partial_with_shared_time_remaining()
     rail = BrowserRuntimeRail(runtime)
     rail._bind_shared_task_deadline(ctx, session, state)
     shared_deadline = state["deadline_at"]
-    ctx.extra["__browser_invocation_deadline__"] = runtime_module.time.monotonic() - 1
+    ctx.extra["__browser_invocation_deadline__"] = rail_module.time.monotonic() - 1
 
     assert rail._finish_if_task_deadline_exhausted(ctx, session, state) is True
 
@@ -1952,7 +1948,7 @@ def test_resume_keeps_shared_deadline_and_gets_a_fresh_invocation_slice() -> Non
     assert resumed["resume_count"] == 1
     assert "task_invocation_slice_exhausted" not in resumed["blockers"]
     assert second_remaining > 0
-    assert second_ctx.extra["__browser_invocation_deadline__"] > runtime_module.time.monotonic()
+    assert second_ctx.extra["__browser_invocation_deadline__"] > rail_module.time.monotonic()
 
 
 def test_structured_resume_preserves_original_slots_and_evidence() -> None:
@@ -2068,7 +2064,7 @@ def test_before_model_call_explains_screenshot_is_disabled_without_image_support
     runtime = MagicMock(spec=BrowserAgentRuntime)
     builder = SystemPromptBuilder(language="en")
     agent = MagicMock()
-    agent.deep_config = SimpleNamespace(enable_read_image_multimodal=False)
+    agent.deep_config = SimpleNamespace(enable_read_image_multimodal=False, language="en")
     agent.system_prompt_builder = builder
     rail = BrowserRuntimeRail(runtime)
 
@@ -2084,7 +2080,7 @@ def test_before_model_call_limits_screenshot_use_for_multimodal_model() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
     builder = SystemPromptBuilder(language="en")
     agent = MagicMock()
-    agent.deep_config = SimpleNamespace(enable_read_image_multimodal=True)
+    agent.deep_config = SimpleNamespace(enable_read_image_multimodal=True, language="en")
     agent.system_prompt_builder = builder
     rail = BrowserRuntimeRail(runtime)
 
@@ -2121,68 +2117,44 @@ def test_before_model_call_initializes_runtime_task_state_without_progress_attac
 
 
 def test_after_tool_call_records_browser_tool_progress() -> None:
-    runtime = MagicMock(spec=BrowserAgentRuntime)
-    runtime.service = MagicMock()
-    runtime.service._progress_by_session = {}
-    runtime.service.record_tool_progress = MagicMock()
-    runtime.service.export_progress_state = MagicMock(
-        return_value={
-            "status": "partial",
-            "completed_steps": [],
-            "remaining_steps": [],
-            "next_step": None,
-            "completion_evidence": [],
-            "missing_requirements": [],
-            "recent_tool_steps": ["browser_navigate: https://example.com"],
-            "last_page": {"url": "https://example.com", "title": "Example"},
-            "last_screenshot": None,
-            "last_worker_final": None,
-            "request_id": None,
-        }
-    )
+    runtime = make_runtime(mcp_fake_driver(results=[result(url="https://example.com", title="Example")]))
     session = _FakeSession()
     session.update_state({"__browser_phase_budget_state__": BrowserRuntimeRail._build_phase_state("open example.com")})
-    ctx = AgentCallbackContext(
-        agent=MagicMock(),
-        session=session,
-        inputs=ToolCallInputs(
-            tool_name="browser_navigate",
-            tool_result=ToolOutput(success=True, data={"page": {"url": "https://example.com", "title": "Example"}}),
-        ),
-    )
+    output = _invoke(runtime, NAVIGATE, {"url": "https://example.com"})
+    ctx = _tool_ctx(runtime, NAVIGATE, {"url": "https://example.com"}, output, session=session)
     rail = BrowserRuntimeRail(runtime)
 
     _run(rail.after_tool_call(ctx))
 
-    runtime.service.record_tool_progress.assert_not_called()
     task_state = session.get_state("__browser_phase_budget_state__")
     assert len(task_state["recent_actions"]) == 1
     assert task_state["recent_actions"][0]["action_class"] == "navigation"
+    assert task_state["last_page"] == {"url": "https://example.com", "title": "Example"}
     assert session.get_state("__browser_subagent_progress_state__")["recent_tool_steps"]
+    assert ctx.inputs.tool_msg.metadata == {
+        "success": True,
+        "executed": True,
+        "state_changed": True,
+        "denied": False,
+        "effect": "navigate",
+    }
 
 
 def test_after_tool_call_does_not_advance_state_for_string_mcp_error() -> None:
-    runtime = _make_bare_runtime()
+    driver = mcp_fake_driver()
+    driver.fail_next(DriverError("Element is not actionable", dispatched=True))
+    runtime = make_runtime(driver)
     session = _FakeSession()
-    session.update_state(
-        {"__browser_phase_budget_state__": BrowserRuntimeRail._build_phase_state("Open the result")}
-    )
-    tool_message = ToolMessage(tool_call_id="failed-click", content="")
-    ctx = AgentCallbackContext(
-        agent=MagicMock(),
-        session=session,
-        inputs=ToolCallInputs(
-            tool_name="mcp_playwright-official_browser_click",
-            tool_args={"target": "e4"},
-            tool_result="### Error\nElement is not actionable",
-            tool_msg=tool_message,
-        ),
-    )
+    session.update_state({"__browser_phase_budget_state__": BrowserRuntimeRail._build_phase_state("Open the result")})
+    output = _invoke(runtime, CLICK, {"target": "e4"})
+    ctx = _tool_ctx(runtime, CLICK, {"target": "e4"}, output, session=session)
+    tool_message = ctx.inputs.tool_msg
     rail = BrowserRuntimeRail(runtime)
 
     _run(rail.after_tool_call(ctx))
 
-    assert ctx.inputs.tool_result["ok"] is False
+    assert command_record(ctx.inputs.tool_result).ok is False
+    assert tool_message.content.startswith("### Error")
     assert tool_message.metadata["success"] is False
     assert tool_message.metadata["executed"] is True
     assert tool_message.metadata["state_changed"] is False
@@ -2192,22 +2164,14 @@ def test_after_tool_call_does_not_advance_state_for_string_mcp_error() -> None:
 
 
 def test_after_tool_call_marks_mutating_timeout_as_ambiguous_for_reconciliation() -> None:
-    runtime = _make_bare_runtime()
+    driver = mcp_fake_driver()
+    driver.fail_next(ActionTimeout("click timed out after 2500ms", dispatched=True))
+    runtime = make_runtime(driver)
     session = _FakeSession()
-    session.update_state(
-        {"__browser_phase_budget_state__": BrowserRuntimeRail._build_phase_state("Open the result")}
-    )
-    tool_message = ToolMessage(tool_call_id="timeout-click", content="")
-    ctx = AgentCallbackContext(
-        agent=MagicMock(),
-        session=session,
-        inputs=ToolCallInputs(
-            tool_name="mcp_playwright-official_browser_click",
-            tool_args={"target": "e4"},
-            tool_result="Error: click timed out after 2500ms",
-            tool_msg=tool_message,
-        ),
-    )
+    session.update_state({"__browser_phase_budget_state__": BrowserRuntimeRail._build_phase_state("Open the result")})
+    output = _invoke(runtime, CLICK, {"target": "e4"})
+    ctx = _tool_ctx(runtime, CLICK, {"target": "e4"}, output, session=session)
+    tool_message = ctx.inputs.tool_msg
     rail = BrowserRuntimeRail(runtime)
 
     _run(rail.after_tool_call(ctx))
@@ -2217,6 +2181,35 @@ def test_after_tool_call_marks_mutating_timeout_as_ambiguous_for_reconciliation(
     state = session.get_state("__browser_phase_budget_state__")
     assert state["recent_actions"][-1]["outcome_status"] == "ambiguous"
     assert state["recent_actions"][-1]["semantic_delta"] == "awaiting_observation"
+
+
+def test_after_tool_call_copies_the_record_metadata_onto_the_tool_message() -> None:
+    runtime = make_runtime(mcp_fake_driver(observations=[observation([element("e1")])]))
+    output = _invoke(runtime, SNAPSHOT, {})
+    ctx = _tool_ctx(runtime, SNAPSHOT, {}, output)
+
+    _run(BrowserRuntimeRail(runtime).after_tool_call(ctx))
+
+    expected = command_record(output).message_metadata | {"denied": False, "effect": "read"}
+    assert ctx.inputs.tool_msg.metadata == expected
+
+
+def test_after_tool_call_treats_a_policy_denial_as_not_executed() -> None:
+    rail = BrowserRuntimeRail(_mock_runtime())
+    ctx = AgentCallbackContext(
+        agent=MagicMock(),
+        inputs=ToolCallInputs(
+            tool_name=CLICK,
+            tool_args={"target": "e1"},
+            tool_result=rail_module.PolicyDenied("off limits"),
+            tool_msg=ToolMessage(tool_call_id="denied", content="### Error\noff limits"),
+        ),
+    )
+
+    _run(rail.after_tool_call(ctx))
+
+    assert ctx.inputs.tool_msg.metadata["denied"] is True
+    assert ctx.inputs.tool_msg.metadata["executed"] is False
 
 
 def test_after_invoke_rewrites_max_iteration_with_failure_summary() -> None:
@@ -2229,7 +2222,6 @@ def test_after_invoke_rewrites_max_iteration_with_failure_summary() -> None:
             last_screenshot=None,
         )
     }
-    runtime.service.export_progress_state = MagicMock(return_value={"status": "partial"})
     runtime.service.build_failure_summary = MagicMock(return_value="Failure summary for continuation:\n- step")
     session = _FakeSession()
     session.update_state(
@@ -2260,9 +2252,7 @@ def test_after_invoke_renders_authoritative_max_iteration_result() -> None:
     session = _FakeSession()
     state = BrowserRuntimeRail._build_phase_state("Return the product title and price")
     state["field_coverage"] = ["title"]
-    state["structured_evidence"] = [
-        {"fields": ["title"], "values": {"title": "Keyboard"}}
-    ]
+    state["structured_evidence"] = [{"fields": ["title"], "values": {"title": "Keyboard"}}]
     session.update_state({"__browser_phase_budget_state__": state})
     result = {"output": MAX_ITERATION_MESSAGE, "result_type": "error"}
     ctx = AgentCallbackContext(
@@ -2284,14 +2274,6 @@ def test_after_invoke_renders_authoritative_max_iteration_result() -> None:
 def test_after_invoke_promotes_completed_progress_block() -> None:
     runtime = MagicMock(spec=BrowserAgentRuntime)
     runtime.service = MagicMock()
-    runtime.service.get_progress_state = MagicMock(return_value=MagicMock(is_empty=MagicMock(return_value=False)))
-    runtime.service.record_worker_progress = MagicMock()
-    runtime.service.export_progress_state = MagicMock(
-        return_value={
-            "status": "completed",
-            "completion_evidence": ["Saved the settings page"],
-        }
-    )
     runtime.service.should_treat_as_completed = MagicMock(return_value=True)
     session = _FakeSession()
     result = {
@@ -2347,3 +2329,104 @@ def test_after_invoke_cannot_override_runtime_terminal_state_without_progress_bl
     assert result["result_type"] == "error"
     assert result["failure_summary"] == "runtime blocked: captcha"
     assert session.get_state("__browser_phase_budget_state__")["blockers"] == ["captcha"]
+
+
+def test_a_failing_status_logger_is_logged_and_stays_inside_the_rail() -> None:
+    rail = BrowserRuntimeRail(_mock_runtime())
+    error = RuntimeError("status sink closed")
+    rail._status_logger = SimpleNamespace(before_invoke=MagicMock(side_effect=error))
+    warn = rail_module.browser_agent_log_warning
+
+    with patch.object(rail_module, "browser_agent_log_warning", wraps=warn) as warned:
+        rail._emit_status("before_invoke", AgentCallbackContext(agent=MagicMock()))
+
+    assert warned.call_args.args[1:] == ("before_invoke", error)
+
+
+def _deep_agent_shaped(verdict: bool) -> tuple[AgentCallbackContext, SimpleNamespace]:
+    model = Model(
+        model_client_config=ModelClientConfig(
+            client_provider="openai", api_key="test-key", api_base="https://example.invalid/v1", verify_ssl=False
+        ),
+        model_config=ModelRequestConfig(model="test-model"),
+    )
+    set_cached_image_support(probe_cache_key(model), verdict)
+    outer = MagicMock()
+    outer.deep_config = SimpleNamespace(enable_read_image_multimodal=None, model=model, language="en")
+    inner = SimpleNamespace(system_prompt_builder=SystemPromptBuilder(language="en"))
+    return AgentCallbackContext(agent=outer), inner
+
+
+def _screenshot_batch(inner: SimpleNamespace) -> AgentCallbackContext:
+    return AgentCallbackContext(
+        agent=inner,
+        inputs=ToolCallInputs(tool_name="browser_batch_interact", tool_args={"steps": [{"op": "screenshot"}]}),
+    )
+
+
+@pytest.mark.parametrize("verdict", [True, False])
+def test_the_inner_agents_hooks_take_image_support_from_the_outer_deep_agents_probe_verdict(verdict: bool) -> None:
+    runtime = make_runtime(image_support=None)
+    runtime.ensure_runtime_ready = AsyncMock()
+    rail = BrowserRuntimeRail(runtime)
+    outer_ctx, inner = _deep_agent_shaped(verdict)
+
+    with patch.object(runtime, "agent_parts", wraps=runtime.agent_parts) as parts:
+        _run(rail.before_invoke(outer_ctx))
+    _run(rail.before_model_call(AgentCallbackContext(agent=inner)))
+    tool_ctx = _screenshot_batch(inner)
+    with patch.object(rail, "_consume_phase_budget", return_value=""):
+        _run(rail.before_tool_call(tool_ctx))
+
+    parts.assert_called_once_with(image_support=verdict, language="en")
+    prompt = inner.system_prompt_builder.build()
+    assert ("The current model can inspect image input" in prompt) is verdict
+    assert ("Image input is unavailable" in prompt) is not verdict
+    denied = tool_ctx.inputs.tool_result
+    assert (denied is not None and denied["error"]["code"] == "browser_image_input_unavailable") is not verdict
+
+
+_LOST = "the browser connection was lost again; the task cannot continue"
+
+
+def _runtime_with_a_lost_session() -> MagicMock:
+    runtime = MagicMock(spec=BrowserAgentRuntime)
+    runtime.service = MagicMock()
+    runtime.service._progress_by_session = {}
+    runtime.session = SimpleNamespace(lost=_LOST)
+    return runtime
+
+
+def test_after_invoke_marks_a_lost_connection_blocked_with_its_reason_even_over_evidence() -> None:
+    session = _FakeSession()
+    state = BrowserRuntimeRail._build_phase_state("Return the product title and price")
+    state["field_coverage"] = ["title"]
+    state["structured_evidence"] = [{"fields": ["title"], "values": {"title": "Keyboard"}}]
+    session.update_state({"__browser_phase_budget_state__": state})
+    result = {"output": _LOST, "result_type": "error", "error": _LOST}
+    ctx = AgentCallbackContext(
+        agent=MagicMock(),
+        session=session,
+        inputs=InvokeInputs(query="Return the product title and price", result=result),
+    )
+
+    _run(BrowserRuntimeRail(_runtime_with_a_lost_session()).after_invoke(ctx))
+
+    authoritative = result["authoritative_browser_result"]
+    assert (authoritative["status"], authoritative["terminal_reason"]) == ("blocked", "browser_connection_lost")
+    assert "browser_connection_lost" in authoritative["blockers"]
+    assert authoritative["summary"] == _LOST
+    assert (result["result_type"], result["error"]) == ("error", "browser_task_incomplete")
+
+
+def test_a_task_ended_by_a_lost_connection_is_retryable_and_a_resume_drops_the_blocker() -> None:
+    session = _FakeSession()
+    state = BrowserRuntimeRail._build_phase_state("Open the scene")
+    state.update({"status": "blocked", "terminal_reason": "browser_connection_lost"})
+    state["blockers"] = ["browser_connection_lost"]
+    rail = BrowserRuntimeRail(_runtime_with_a_lost_session())
+
+    assert rail._terminal_result_retryable(state) is True
+    resumed = rail._resume_task_state(session, state, "Open the scene again")
+
+    assert (resumed["status"], resumed["terminal_reason"], resumed["blockers"]) == ("in_progress", "", [])

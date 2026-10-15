@@ -14,10 +14,10 @@ The tools available to the sub-agent — both the Playwright MCP primitives and 
 | [Capability allowlist](#browser-capabilities) | Playwright tools are grouped into named capabilities (`core`, `pdf`, `vision`, `devtools`, `config`, `network`, `storage`, `testing`). The caller selects capabilities per task; only the expanded tool allowlist is exposed to the model. |
 | [Runtime helper tools](../tools/browser_tools.md#runtime-helper-tools) | Page probes, batch interaction, custom actions, cancellation, and health checks, injected alongside the Playwright primitives. |
 | [Browser options](#browser-options) | Headless vs. headed operation, browser engine choice, session persistence, viewport/device emulation, proxies, and output directories. |
-| [Browser instance isolation](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeconfigbrowserinstanceconfig) | `BrowserInstanceConfig` gives each agent its own browser (own MCP server, Chrome profile, and CDP port); agents sharing a key intentionally share one browser. |
+| [Browser instance isolation](#class-openjiuwenharnesstoolsbrowser_moveruntimeconfigbrowserinstanceconfig) | `BrowserInstanceConfig` gives each agent its own browser (own MCP server, Chrome profile, and CDP port); agents sharing a key intentionally share one browser. |
 | [Driver modes](#driver-modes) | `managed` (launch a dedicated local Chrome), `remote` (attach to an existing CDP endpoint), or `extension` (drive a running browser through the Playwright MCP extension bridge). |
-| [Progress and resumability](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeruntimebrowserruntimerail) | `BrowserRuntimeRail` persists task progress into the session, injects it back as continuation context on the next invocation, and converts incomplete runs into structured failure summaries. |
-| [Guardrails](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeconfigbrowserrunguardrails) | Step, failure, and timeout limits with automatic retry and optional resume after a max-iterations stop. |
+| [Progress and resumability](#class-openjiuwenharnesstoolsbrowser_moveruntimeruntimebrowserruntimerail) | `BrowserRuntimeRail` persists task progress into the session, injects it back as continuation context on the next invocation, and converts incomplete runs into structured failure summaries. |
+| [Guardrails](#class-openjiuwenharnesstoolsbrowser_moveruntimeconfigrunguardrails) | Step, failure, and timeout limits with automatic retry and optional resume after a max-iterations stop. |
 | [Observability](#observability) | A dedicated `logs/browser_agent.log` file and redacted structured status telemetry (`[BROWSER_SUBAGENT]` records). |
 
 ---
@@ -53,9 +53,9 @@ create_browser_agent(
 Create the browser sub-agent. On top of a plain deep agent, this factory:
 
 1. Resolves the requested `browser_capabilities` against the trusted capability catalog (unknown names raise `ValueError` listing the available capabilities).
-2. Builds a [`BrowserAgentRuntime`](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeruntimebrowseragentruntime) from `settings` (or from the model's client config / environment when `settings` is omitted).
+2. Builds a [`BrowserAgentRuntime`](#class-openjiuwenharnesstoolsbrowser_moveruntimeruntimebrowseragentruntime) from `settings` (or from the model's client config / environment when `settings` is omitted).
 3. Appends the [runtime helper tools](../tools/browser_tools.md#runtime-helper-tools) to any caller-provided `tools`.
-4. Appends a [`BrowserRuntimeRail`](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeruntimebrowserruntimerail) to any caller-provided `rails`.
+4. Appends a [`BrowserRuntimeRail`](#class-openjiuwenharnesstoolsbrowser_moveruntimeruntimebrowserruntimerail) to any caller-provided `rails`.
 
 The default system prompt (locale-specific, `cn`/`en`) instructs the agent to prefer compact probes over snapshots, to use `browser_run_code` only with a known selector, and to claim completion only when the outcome is evidenced on the page.
 
@@ -76,9 +76,9 @@ The default system prompt (locale-specific, `cn`/`en`) instructs the agent to pr
 - **sys_operation** (SysOperation, optional): System operation. Default: `None`.
 - **language** (str, optional): `"cn"` or `"en"`; anything else falls back to `"cn"`. Default: `None`.
 - **prompt_mode** (str, optional): Prompt mode. Default: `None`.
-- **settings** ([RuntimeSettings](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeconfigruntimesettings), optional): Full browser runtime override (provider, API key/base, model, MCP config, guardrails, instance). Default: resolved from `model` or environment variables.
+- **settings** ([RuntimeSettings](#class-openjiuwenharnesstoolsbrowser_moveruntimeconfigruntimesettings), optional): Full browser runtime override (provider, API key/base, model, MCP config, guardrails, instance). Default: resolved from `model` or environment variables.
 - **browser_key** (str, optional): Shorthand for `browser_instance=BrowserInstanceConfig(key=...)`. Default: `None`.
-- **browser_instance** ([BrowserInstanceConfig](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeconfigbrowserinstanceconfig) | dict, optional): Per-instance browser identity. A plain dict is accepted so the identity can travel as serializable `factory_kwargs`. Default: `None` (legacy shared, environment-driven browser).
+- **browser_instance** ([BrowserInstanceConfig](#class-openjiuwenharnesstoolsbrowser_moveruntimeconfigbrowserinstanceconfig) | dict, optional): Per-instance browser identity. A plain dict is accepted so the identity can travel as serializable `factory_kwargs`. Default: `None` (legacy shared, environment-driven browser).
 - **browser_capabilities** (list[str], optional): Task-scoped capability names from the [capability catalog](#browser-capabilities). `core` is always included. `None` means no allowlist restriction. Default: `None`.
 - ****config_kwargs**: Additional configuration arguments forwarded to `create_deep_agent`.
 
@@ -169,7 +169,7 @@ The sub-session ID for `browser_agent` is deterministic (`{parent_session}_sub_b
 
 ## Browser Capabilities
 
-Module: `openjiuwen.harness.tools.browser_move.playwright_runtime.browser_capabilities`
+Module: `openjiuwen.harness.tools.browser_move.surfaces.browser.capabilities`
 
 Playwright MCP tools are grouped into a trusted, explicit catalog of capabilities. Matching is by exact tool name — never by prefix — so a newly introduced Playwright tool is not exposed before its policy is reviewed. The main agent selects capability names per task; the resolver performs no task interpretation of its own.
 
@@ -249,7 +249,7 @@ Headed operation is the safer default for sites with bot detection and for debug
 ### Timeouts
 
 - **Per tool call**: `PLAYWRIGHT_MCP_TIMEOUT_S` / `BROWSER_TIMEOUT_S` (default `180`) bounds each MCP tool invocation.
-- **Per task attempt**: `BrowserRunGuardrails.timeout_s` (default `180`) bounds a whole delegated browser task; see [Guardrails](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeconfigbrowserrunguardrails).
+- **Per task attempt**: `RunGuardrails.timeout_s` (default `180`) bounds a whole delegated browser task; see [Guardrails](#class-openjiuwenharnesstoolsbrowser_moveruntimeconfigrunguardrails).
 - **Per batch step**: `browser_batch_interact` clamps step timeouts to 250–30000 ms with a global batch cap of 90 s.
 
 ### Output directories
@@ -258,7 +258,7 @@ The runtime resolves a working directory (`PLAYWRIGHT_RUNTIME_MCP_CWD`, default:
 
 ---
 
-## class openjiuwen.harness.tools.browser_move.playwright_runtime.config.BrowserInstanceConfig
+## class openjiuwen.harness.tools.browser_move.surfaces.browser.runner.settings.BrowserInstanceConfig
 
 ```python
 @dataclass(frozen=True)
@@ -276,6 +276,7 @@ Per-instance browser identity, used to isolate one browser per agent. All fields
 - **profile_name** (str): Managed profile name. Empty falls back to the key, then `BROWSER_PROFILE_NAME`.
 - **cdp_url** (str): Explicit CDP endpoint for remote mode; wins over the shared environment endpoint.
 - **browser_binary** (str): Optional Chrome binary path override.
+- **launch_args** (str): Playwright MCP launch arguments in the `PLAYWRIGHT_MCP_ARGS` format (a shell-style string or a JSON list). Empty defers to `PLAYWRIGHT_MCP_ARGS`, then the default; a caller that decides headless or isolated mode per run sets this instead of the environment.
 
 ### Driver Modes
 
@@ -285,7 +286,7 @@ Per-instance browser identity, used to isolate one browser per agent. All fields
 
 ---
 
-## class openjiuwen.harness.tools.browser_move.playwright_runtime.config.RuntimeSettings
+## class openjiuwen.harness.tools.browser_move.surfaces.browser.runner.settings.RuntimeSettings
 
 ```python
 @dataclass(frozen=True)
@@ -301,18 +302,18 @@ Resolved browser runtime settings, stored in `SubAgentConfig.factory_kwargs` and
 - **api_base** (str): Model API base URL.
 - **model_name** (str): Model name for the nested browser worker.
 - **mcp_cfg** (McpServerConfig): Playwright MCP server configuration (stdio; command defaults to `npx -y @playwright/mcp@0.0.78` with the full capability list enabled via `--caps=`).
-- **guardrails** ([BrowserRunGuardrails](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeconfigbrowserrunguardrails)): Run guardrails.
-- **instance** ([BrowserInstanceConfig](#class-openjiuwenharnesstoolsbrowser_moveplaywright_runtimeconfigbrowserinstanceconfig), optional): Per-instance browser identity.
+- **guardrails** ([RunGuardrails](#class-openjiuwenharnesstoolsbrowser_moveruntimeconfigrunguardrails)): Run guardrails.
+- **instance** ([BrowserInstanceConfig](#class-openjiuwenharnesstoolsbrowser_moveruntimeconfigbrowserinstanceconfig), optional): Per-instance browser identity.
 
 Use `build_runtime_settings(instance)` to resolve everything from environment variables, or let `create_browser_agent` derive provider/key/base/model from the `Model` object's client config.
 
 ---
 
-## class openjiuwen.harness.tools.browser_move.playwright_runtime.config.BrowserRunGuardrails
+## class openjiuwen.harness.tools.browser_move.runtime.config.RunGuardrails
 
 ```python
 @dataclass
-class BrowserRunGuardrails
+class RunGuardrails
 ```
 
 Limits applied to browser task runs. Built from environment variables by `build_browser_guardrails()`.
@@ -329,7 +330,7 @@ Retryable transport failures (detached frame, target closed, page crash, `net::E
 
 ---
 
-## class openjiuwen.harness.tools.browser_move.playwright_runtime.runtime.BrowserAgentRuntime
+## class openjiuwen.harness.tools.browser_move.surfaces.browser.runner.facade.BrowserAgentRuntime
 
 ```python
 class BrowserAgentRuntime(
@@ -338,7 +339,7 @@ class BrowserAgentRuntime(
     api_base: str,
     model_name: str,
     mcp_cfg: McpServerConfig,
-    guardrails: BrowserRunGuardrails,
+    guardrails: RunGuardrails,
     instance: BrowserInstanceConfig | None = None,
     allowed_tool_names: Iterable[str] | None = None,
 )
@@ -359,7 +360,7 @@ Runtime kernel shared by all browser helper tools. Owns the underlying `BrowserS
 
 ---
 
-## class openjiuwen.harness.tools.browser_move.playwright_runtime.runtime.BrowserRuntimeRail
+## class openjiuwen.harness.tools.browser_move.surfaces.browser.rails.runtime_rail.BrowserRuntimeRail
 
 ```python
 class BrowserRuntimeRail(runtime: BrowserAgentRuntime)

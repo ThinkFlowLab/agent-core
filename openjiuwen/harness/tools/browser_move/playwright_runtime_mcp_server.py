@@ -1,67 +1,56 @@
 # coding: utf-8
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 
-"""MCP server wrapper for Playwright browser runtime.
-
-Usage (from repo root):
-  uv run python src/playwright_runtime_mcp_server.py
-  uv run python src/playwright_runtime_mcp_server.py --transport streamable-http --host 127.0.0.1 --port 8940
-"""
+"""MCP server entry point for the browser runtime; run it with ``python -m`` and this module path."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import os
-import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-# Ensure repo and src packages are importable when running as a script.
-_HERE = Path(__file__).resolve().parent
-_SRC_ROOT = _HERE
-_REPO_ROOT = _SRC_ROOT.parent
-for _p in (str(_REPO_ROOT), str(_SRC_ROOT)):
-    if _p not in sys.path:
-        sys.path.append(_p)
-
 from fastmcp import Context, FastMCP
-from clients.stdio_client import BrowserMoveStdioClient
-from clients.streamable_http_client import BrowserMoveStreamableHttpClient
-from playwright_runtime.config import (
-    DEFAULT_BROWSER_TIMEOUT_S,
+
+from openjiuwen.harness.tools.browser_move.contract import SurfaceSettings
+from openjiuwen.harness.tools.browser_move.runtime.config import (
     MISSING_API_KEY_MESSAGE,
-    build_runtime_settings,
+    CoreSettings,
+    RuntimeServerSettings,
     load_repo_dotenv,
+    process_environ,
+    runtime_server_environ,
 )
-from controllers.action import (
+from openjiuwen.harness.tools.browser_move.surfaces.browser.helpers import register_custom_action_specs
+from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.actions import (
     bind_runtime,
     clear_runtime_runner,
+    get_default_controller,
     list_actions,
     register_builtin_actions,
     run_action,
 )
-
-# Use browser_move client subclasses for MCP transport retry and timeout handling.
-import openjiuwen.core.runner.resources_manager.tool_manager as _tool_mgr_mod
+from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.settings import (
+    browser_surface_settings,
+    build_runtime_settings,
+)
 
 if TYPE_CHECKING:
-    from playwright_runtime.runtime import BrowserAgentRuntime
-
-_tool_mgr_mod.StdioClient = BrowserMoveStdioClient
-_tool_mgr_mod.StreamableHttpClient = BrowserMoveStreamableHttpClient
+    from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.facade import BrowserAgentRuntime
 
 _runtime: Optional["BrowserAgentRuntime"] = None
 _runtime_lock = asyncio.Lock()
+_core_settings: Optional[CoreSettings] = None
+_browser_settings: Optional[SurfaceSettings] = None
 
 load_repo_dotenv()
 
 
 def _build_runtime() -> "BrowserAgentRuntime":
-    from playwright_runtime.runtime import BrowserAgentRuntime
+    from openjiuwen.harness.tools.browser_move.surfaces.browser.runner.facade import BrowserAgentRuntime
 
-    settings = build_runtime_settings()
+    settings = build_runtime_settings(core_settings=_core_settings, browser_settings=_browser_settings)
     if not settings.api_key:
         raise RuntimeError(MISSING_API_KEY_MESSAGE)
     return BrowserAgentRuntime(
@@ -71,6 +60,8 @@ def _build_runtime() -> "BrowserAgentRuntime":
         model_name=settings.model_name,
         mcp_cfg=settings.mcp_cfg,
         guardrails=settings.guardrails,
+        core_settings=_core_settings,
+        browser_settings=_browser_settings,
     )
 
 
@@ -126,6 +117,7 @@ def _resolve_request_id(explicit_request_id: str, ctx: Context | None = None) ->
 async def _lifespan(_server: FastMCP):
     try:
         register_builtin_actions()
+        register_custom_action_specs(get_default_controller(), upload_root=None)
         yield {}
     finally:
         await _shutdown_runtime()
@@ -168,8 +160,6 @@ async def browser_run_task(
         request_id=effective_request_id or None,
         timeout_s=timeout_s if timeout_s > 0 else None,
     )
-    # Strip base64 screenshot from MCP response — it becomes a ToolMessage in
-    # calling agent context and can exceed the LLM context window on its own.
     screenshot = result.get("screenshot")
     if isinstance(screenshot, str) and screenshot.startswith("data:"):
         result = {**result, "screenshot": "[screenshot saved]"}
@@ -222,7 +212,7 @@ async def browser_clear_cancel(
         "Or use coord_source_x+coord_source_y+coord_target_x+coord_target_y. "
         "Aliases source/target and source_x/source_y/target_x/target_y are accepted. "
         "Use list_upload_files to discover files available at BROWSER_UPLOAD_ROOT before uploading. "
-        "Register your own via controllers.action.register_action."
+        "Register your own via surfaces.browser.runner.actions.register_action."
     ),
 )
 async def browser_custom_action(
@@ -265,45 +255,46 @@ async def browser_list_custom_actions() -> dict[str, Any]:
     description="Return runtime readiness and selected model/provider config.",
 )
 async def browser_runtime_health() -> dict[str, Any]:
-    settings = build_runtime_settings()
-    svc = _runtime.service if _runtime is not None else None
+    settings = build_runtime_settings(core_settings=_core_settings, browser_settings=_browser_settings)
+    health = await _runtime.runtime_health() if _runtime is not None else {}
     return {
-        "ok": svc.connection_healthy if svc is not None else False,
+        "ok": bool(health.get("ok", False)),
         "started": _runtime is not None,
-        "last_heartbeat_ok": svc.last_heartbeat_ok if svc is not None else None,
+        "detail": health.get("detail"),
         "provider": settings.provider,
         "api_base": settings.api_base,
         "model_name": settings.model_name,
     }
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(settings: RuntimeServerSettings | None = None) -> argparse.Namespace:
+    settings = settings or RuntimeServerSettings.server_from_env(process_environ())
     parser = argparse.ArgumentParser(description="Playwright runtime MCP server")
     parser.add_argument(
         "--transport",
         choices=["stdio", "sse", "streamable-http", "http"],
-        default=(os.getenv("PLAYWRIGHT_RUNTIME_MCP_TRANSPORT") or "stdio").strip().lower(),
+        default=settings.transport,
         help="MCP transport mode. Use stdio for agent-launched server; sse/http for standalone server.",
     )
     parser.add_argument(
         "--host",
-        default=(os.getenv("PLAYWRIGHT_RUNTIME_MCP_HOST") or "127.0.0.1").strip(),
+        default=settings.host,
         help="Host for sse/http transports.",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=int((os.getenv("PLAYWRIGHT_RUNTIME_MCP_PORT") or "8940").strip()),
+        default=int(settings.port),
         help="Port for sse/http transports.",
     )
     parser.add_argument(
         "--path",
-        default=(os.getenv("PLAYWRIGHT_RUNTIME_MCP_PATH") or "").strip(),
+        default=settings.path,
         help="Optional custom endpoint path for sse/http transports.",
     )
     parser.add_argument(
         "--log-level",
-        default=(os.getenv("PLAYWRIGHT_RUNTIME_MCP_LOG_LEVEL") or "INFO").strip(),
+        default=settings.log_level,
         help="Server log level.",
     )
     parser.add_argument(
@@ -322,40 +313,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _apply_timeout_defaults() -> None:
-    """Set runtime timeout defaults based on transport when not explicitly provided."""
-    timeout_text = str(DEFAULT_BROWSER_TIMEOUT_S)
-    os.environ.setdefault("BROWSER_TIMEOUT_S", timeout_text)
-    os.environ.setdefault("PLAYWRIGHT_TOOL_TIMEOUT_S", os.getenv("BROWSER_TIMEOUT_S", timeout_text))
-
-
-def _resolve_stateless_http(args: argparse.Namespace) -> bool:
+def _resolve_stateless_http(args: argparse.Namespace, settings: RuntimeServerSettings) -> bool:
     """Resolve whether to run HTTP transports in stateless mode."""
     if args.stateless_http:
         return True
+    if settings.stateless_http is not None:
+        return settings.stateless_http
 
-    env_raw = (os.getenv("PLAYWRIGHT_RUNTIME_MCP_STATELESS_HTTP") or "").strip().lower()
-    if env_raw in {"1", "true", "yes", "on"}:
-        return True
-    if env_raw in {"0", "false", "no", "off"}:
-        return False
-
-    # Default to stateless for streamable/http to avoid stateful session crashes.
     return args.transport in {"streamable-http", "http"}
 
 
-def _configure_stdio_logging() -> None:
+def _configure_stdio_logging(log_dir: Path | None) -> None:
     """Prevent application logs from polluting stdio JSON-RPC output."""
     try:
         from openjiuwen.core.common.logging.default.log_config import log_config
         from openjiuwen.core.common.logging.manager import LogManager
 
-        configured = (
-            (os.getenv("PLAYWRIGHT_RUNTIME_LOG_DIR") or "").strip()
-            or (os.getenv("BROWSER_RUNTIME_LOG_DIR") or "").strip()
-        )
-        if configured:
-            log_path = str(Path(configured).expanduser().resolve())
+        if log_dir is not None:
+            log_path = str(log_dir.resolve())
         else:
             log_path = str((Path.cwd().expanduser().resolve() / "logs").resolve())
         log_config._log_config["log_path"] = log_path
@@ -376,11 +351,16 @@ def _configure_stdio_logging() -> None:
 
 
 def main() -> None:
+    global _core_settings, _browser_settings
+
     load_repo_dotenv()
-    args = parse_args()
+    environ = runtime_server_environ(process_environ())
+    server_settings = RuntimeServerSettings.server_from_env(environ)
+    args = parse_args(server_settings)
     if args.transport == "stdio":
-        _configure_stdio_logging()
-    _apply_timeout_defaults()
+        _configure_stdio_logging(server_settings.log_dir)
+    _core_settings = CoreSettings.from_env(environ)
+    _browser_settings = browser_surface_settings(environ)
     kwargs: Dict[str, Any] = {
         "show_banner": not args.no_banner,
         "log_level": args.log_level,
@@ -390,7 +370,7 @@ def main() -> None:
         kwargs["port"] = args.port
         if args.path:
             kwargs["path"] = args.path
-    if args.transport in {"streamable-http", "http"} and _resolve_stateless_http(args):
+    if args.transport in {"streamable-http", "http"} and _resolve_stateless_http(args, server_settings):
         kwargs["stateless_http"] = True
     mcp.run(transport=args.transport, **kwargs)
 

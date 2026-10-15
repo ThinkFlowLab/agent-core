@@ -4,22 +4,17 @@
 from __future__ import annotations
 
 import asyncio
-import gzip
 import importlib.util
-import json
 import logging
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from openjiuwen.core.common.logging.browser_context import (
-    reset_browser_agent_log_context,
-    set_browser_agent_log_context,
-)
-from openjiuwen.harness.tools.browser_move.playwright_runtime.browser_logging import (
-    write_browser_agent_audit_artifact,
-)
+from openjiuwen.core.foundation.tool.schema import ToolOutput
+from openjiuwen.harness.tools.browser_move.contract import ActionResult, ContextRef, Observation, Observe
+from openjiuwen.harness.tools.browser_move.runtime.tool_factory import CommandRecord
+from openjiuwen.harness.tools.browser_move.surfaces.browser.context import BrowserContext
 
 _STATUS_LOGGING_PATH = (
     Path(__file__).resolve().parents[5]
@@ -27,7 +22,8 @@ _STATUS_LOGGING_PATH = (
     / "harness"
     / "tools"
     / "browser_move"
-    / "playwright_runtime"
+    / "surfaces"
+    / "browser"
     / "status_logging.py"
 )
 _SPEC = importlib.util.spec_from_file_location("browser_status_logging", _STATUS_LOGGING_PATH)
@@ -62,55 +58,6 @@ class FakeAgent:
 
 def _run(coro: Any) -> Any:
     return asyncio.run(coro)
-
-
-def test_raw_browser_observation_is_written_only_to_audit_artifact(
-    tmp_path: Path,
-    monkeypatch: Any,
-) -> None:
-    log_path = tmp_path / "browser_agent.log"
-    monkeypatch.setenv("OPENJIUWEN_BROWSER_AGENT_LOG_FILE", str(log_path))
-    monkeypatch.setenv("OPENJIUWEN_BROWSER_AGENT_AUDIT_RAW", "1")
-    token = set_browser_agent_log_context(True)
-    try:
-        audit = write_browser_agent_audit_artifact(
-            "card_probe",
-            {"cards": [{"title": "private raw card"}]},
-        )
-    finally:
-        reset_browser_agent_log_context(token)
-        browser_logger = logging.getLogger("openjiuwen.browser_agent")
-        for handler in list(browser_logger.handlers):
-            if getattr(handler, "baseFilename", None) == str(log_path):
-                browser_logger.removeHandler(handler)
-                handler.close()
-
-    artifacts = list((tmp_path / "browser_agent_audit").glob("card_probe_*.json.gz"))
-    assert audit["stored"] is True
-    assert len(artifacts) == 1
-    with gzip.open(artifacts[0], mode="rt", encoding="utf-8") as stream:
-        stored = json.load(stream)
-    assert "private raw card" in stored["raw"]
-
-
-def test_raw_browser_observation_audit_is_disabled_by_default(
-    tmp_path: Path,
-    monkeypatch: Any,
-) -> None:
-    log_path = tmp_path / "browser_agent.log"
-    monkeypatch.setenv("OPENJIUWEN_BROWSER_AGENT_LOG_FILE", str(log_path))
-    monkeypatch.delenv("OPENJIUWEN_BROWSER_AGENT_AUDIT_RAW", raising=False)
-    token = set_browser_agent_log_context(True)
-    try:
-        audit = write_browser_agent_audit_artifact(
-            "card_probe",
-            {"cards": [{"title": "private raw card"}]},
-        )
-    finally:
-        reset_browser_agent_log_context(token)
-
-    assert audit["stored"] is False
-    assert not (tmp_path / "browser_agent_audit").exists()
 
 
 def test_status_logger_summarizes_batch_args_without_values() -> None:
@@ -169,12 +116,14 @@ def test_status_logger_redacts_type_and_code_args() -> None:
     logger = BrowserSubagentStatusLogger()
 
     type_summary = logger.summarize_args(
-        "mcp_playwright-official_browser_type",
+        "browser_type",
         {"selector": "#email", "text": "alice@example.com"},
+        "TypeText",
     )
     code_summary = logger.summarize_args(
-        "mcp_playwright-official_browser_run_code_unsafe",
-        {"code": "console.log(document.body.innerText)"},
+        "browser_evaluate",
+        {"function": "console.log(document.body.innerText)"},
+        "RunScript",
     )
 
     assert type_summary["redacted_values"]["text"]["redacted"] is True
@@ -182,6 +131,60 @@ def test_status_logger_redacts_type_and_code_args() -> None:
     assert code_summary["code_redacted"] is True
     assert code_summary["code_length"] == len("console.log(document.body.innerText)")
     assert "document.body" not in str(code_summary)
+
+
+def test_status_logger_summarizes_a_command_result_by_its_record() -> None:
+    logger = BrowserSubagentStatusLogger()
+    observation = Observation(
+        context=ContextRef("0", "tab", "Home"),
+        elements=(),
+        native_text="",
+        surface=BrowserContext(url="https://example.test/results?q=secret", title="Results"),
+    )
+    result = ActionResult(ok=True, generation="g1", observation=observation, surface=observation.surface)
+    record = CommandRecord.of(Observe(), result, value=observation.elements)
+    output = ToolOutput(success=True, data={"content": "### Page\n- Page URL: x\n- a\n- b", "command": record})
+
+    summary = logger.summarize_result("browser_snapshot", output)
+
+    assert summary["kind"] == "command"
+    assert summary["command"] == "Observe"
+    assert summary["effect"] == "read"
+    assert summary["ok"] is True
+    assert summary["line_count"] == 4
+    assert "secret" not in str(summary)
+
+
+def test_status_logger_keys_the_args_summary_by_the_decoded_command(caplog: Any) -> None:
+    backing_logger = logging.getLogger("browser-status-command-test")
+    decoded: list[tuple[str, Any]] = []
+
+    def command_of(tool_name: str, tool_args: Any) -> str:
+        decoded.append((tool_name, tool_args))
+        return "Navigate"
+
+    status_logger = BrowserSubagentStatusLogger(logger=backing_logger, command_of=command_of)
+
+    class FakeCall:
+        id = "tool-call-nav"
+        name = "browser_navigate"
+
+    ctx = SimpleNamespace(
+        inputs=SimpleNamespace(
+            tool_call=FakeCall(), tool_name="browser_navigate", tool_args={"url": "https://a.test/p?token=1"}
+        ),
+        extra={},
+        session=None,
+        agent=object(),
+    )
+
+    with caplog.at_level(logging.INFO, logger="browser-status-command-test"):
+        status_logger.before_tool_call(ctx)
+
+    assert decoded == [("browser_navigate", {"url": "https://a.test/p?token=1"})]
+    assert '"command": "Navigate"' in caplog.text
+    assert '"kind": "navigation"' in caplog.text
+    assert "token=1" not in caplog.text
 
 
 def test_status_logger_emits_backend_marker(caplog: Any) -> None:
@@ -235,7 +238,6 @@ def test_env_toggle_for_status_logging(monkeypatch: Any) -> None:
     assert is_browser_subagent_status_log_enabled() is True
 
 
-
 def test_direct_browser_runtime_rail_wires_status_logger() -> None:
     runtime_path = (
         Path(__file__).resolve().parents[5]
@@ -243,12 +245,17 @@ def test_direct_browser_runtime_rail_wires_status_logger() -> None:
         / "harness"
         / "tools"
         / "browser_move"
-        / "playwright_runtime"
-        / "runtime.py"
+        / "surfaces"
+        / "browser"
+        / "rails"
+        / "runtime_rail.py"
     )
     source = runtime_path.read_text(encoding="utf-8")
 
-    assert "from .status_logging import BrowserSubagentStatusLogger" in source
+    assert (
+        "from openjiuwen.harness.tools.browser_move.surfaces.browser.status_logging import (\n"
+        "    BrowserSubagentStatusLogger,\n"
+    ) in source
     assert 'self._emit_status("before_invoke", ctx)' in source
     assert 'self._emit_status("before_model_call", ctx)' in source
     assert 'self._emit_status("after_model_call", ctx)' in source
@@ -275,13 +282,17 @@ def test_status_logger_accumulates_task_end_totals(caplog: Any) -> None:
         name = "browser_batch_interact"
 
     ctx = SimpleNamespace(
-        inputs=SimpleNamespace(query="Go to https://demoqa.com/automation-practice-form", conversation_id="sess-aggregate"),
+        inputs=SimpleNamespace(
+            query="Go to https://demoqa.com/automation-practice-form", conversation_id="sess-aggregate"
+        ),
         extra={},
         session=FakeSession(),
         agent=object(),
     )
     model_ctx = SimpleNamespace(
-        inputs=SimpleNamespace(messages=["m1"], tools=["t1"], response=SimpleNamespace(content="", reasoning_content="", tool_calls=[])),
+        inputs=SimpleNamespace(
+            messages=["m1"], tools=["t1"], response=SimpleNamespace(content="", reasoning_content="", tool_calls=[])
+        ),
         extra=ctx.extra,
         session=ctx.session,
         agent=ctx.agent,
@@ -346,31 +357,9 @@ def test_status_logger_partial_batch_result_flags() -> None:
     assert summary["steps_failed"] == 1
 
 
-def test_batch_interact_select_option_accepts_values_alias() -> None:
-    action_path = (
-        Path(__file__).resolve().parents[5]
-        / "openjiuwen"
-        / "harness"
-        / "tools"
-        / "browser_move"
-        / "controllers"
-        / "action.py"
-    )
-    source = action_path.read_text(encoding="utf-8")
-
-    assert "step.values !== undefined" in source
-    assert "target.selectOption(values" in source
-    assert "requires value, values," in source
-
-
 def test_react_agent_redacts_browser_tool_arguments() -> None:
     react_agent_path = (
-        Path(__file__).resolve().parents[5]
-        / "openjiuwen"
-        / "core"
-        / "single_agent"
-        / "agents"
-        / "react_agent.py"
+        Path(__file__).resolve().parents[5] / "openjiuwen" / "core" / "single_agent" / "agents" / "react_agent.py"
     )
     source = react_agent_path.read_text(encoding="utf-8")
 
@@ -400,13 +389,17 @@ def test_status_logger_uses_same_run_key_for_conversation_and_session_without_sh
         agent=object(),
     )
     model_ctx = SimpleNamespace(
-        inputs=SimpleNamespace(messages=["m"], tools=["t"], response=SimpleNamespace(content="", reasoning_content="", tool_calls=[])),
+        inputs=SimpleNamespace(
+            messages=["m"], tools=["t"], response=SimpleNamespace(content="", reasoning_content="", tool_calls=[])
+        ),
         extra={},
         session=FakeSession(),
         agent=start_ctx.agent,
     )
     tool_ctx = SimpleNamespace(
-        inputs=SimpleNamespace(tool_call=FakeCall(), tool_name="browser_snapshot", tool_args={}, tool_result={"ok": True}),
+        inputs=SimpleNamespace(
+            tool_call=FakeCall(), tool_name="browser_snapshot", tool_args={}, tool_result={"ok": True}
+        ),
         extra={},
         session=FakeSession(),
         agent=start_ctx.agent,
@@ -453,12 +446,7 @@ def test_status_logger_failed_batch_call_without_step_list_is_error() -> None:
 
 def test_react_agent_redacts_task_tool_description() -> None:
     react_agent_path = (
-        Path(__file__).resolve().parents[5]
-        / "openjiuwen"
-        / "core"
-        / "single_agent"
-        / "agents"
-        / "react_agent.py"
+        Path(__file__).resolve().parents[5] / "openjiuwen" / "core" / "single_agent" / "agents" / "react_agent.py"
     )
     source = react_agent_path.read_text(encoding="utf-8")
 
